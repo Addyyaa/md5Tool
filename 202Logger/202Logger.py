@@ -410,10 +410,15 @@ class ApiClient(QObject):
                         records = data_field
                     elif "records" in obj and isinstance(obj["records"], list):
                         records = obj["records"]
+                # 兼容 data 直接是字符串日志（如 cmd）
                 if isinstance(records, list):
                     pretty = json.dumps(records, ensure_ascii=False, indent=2)
                 else:
-                    pretty = json.dumps(obj, ensure_ascii=False, indent=2)
+                    # 若 obj 本身就是字符串，直接展示
+                    if isinstance(obj, str):
+                        pretty = obj
+                    else:
+                        pretty = json.dumps(obj, ensure_ascii=False, indent=2)
             except (json.JSONDecodeError, ValueError):
                 pretty = data_text
 
@@ -1092,8 +1097,17 @@ class MainWindow(QMainWindow):
                                         buf.extend(str(x).rstrip("\n") for x in val)
                                     elif isinstance(val, str):
                                         buf.extend(val.splitlines())
+                            else:
+                                # JSON 不是 dict（可能是 list/标量），未指定模块时整体纳入
+                                if not selected_module:
+                                    if isinstance(em_obj, list):
+                                        buf.extend(str(x).rstrip("\n") for x in em_obj)
+                                    else:
+                                        buf.extend(str(em).splitlines())
                         except (json.JSONDecodeError, ValueError, TypeError):
-                            pass
+                            # 非 JSON 文本，未指定模块时整体纳入
+                            if not selected_module:
+                                buf.extend(em.splitlines())
                 structured_lines = buf
         except (TypeError, AttributeError):
             structured_lines = None
