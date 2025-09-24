@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+import time
 from typing import Optional
 
 from PySide6.QtCore import (
@@ -50,6 +51,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QPlainTextEdit,
     QFileDialog,
+    QToolButton,
     QSpinBox,
     QStatusBar,
     QWidget,
@@ -78,6 +80,7 @@ class ApiClient(QObject):
     logsFetched = Signal(str)
     requestFailed = Signal(str)
     debugMessage = Signal(str)
+    recordsReceived = Signal(object)
 
     def __init__(self, parent: Optional[QObject] = None) -> None:
         super().__init__(parent)
@@ -89,6 +92,7 @@ class ApiClient(QObject):
         self.last_username: str = ""
         self.last_password: str = ""
         self._debug_enabled: bool = False
+        self._req_meta: dict[int, dict] = {}
         # 使用 CookieJar 维持会话（部分接口将 token 写入 Set-Cookie）
         self._manager.setCookieJar(QNetworkCookieJar(self))
         # 处理 HTTP 基本认证（如网关 401）
@@ -294,11 +298,20 @@ class ApiClient(QObject):
                 b"Authorization", f"Bearer {self._token}".encode("utf-8")
             )
 
+        start_ts = time.time()
         reply = self._manager.get(request)
         request.setRawHeader(b"Accept", b"application/json")
         self._attach_handlers(reply)
         # 调试：抓取请求预览
-        self._debug(f"抓取请求 GET -> {url.toString()}")
+        self._req_meta[id(reply)] = {
+            "t0": start_ts,
+            "method": "GET",
+            "url": url.toString(),
+            "query": query.toString(QUrl.FullyEncoded),
+        }
+        self._debug(
+            f"抓取请求 GET -> {url.toString()}?{self._req_meta[id(reply)]['query']}"
+        )
         reply.finished.connect(lambda r=reply: self._handle_logs_reply(r))
 
     def _handle_logs_reply(self, reply: QNetworkReply) -> None:  # type: ignore[no-untyped-def]
@@ -310,6 +323,13 @@ class ApiClient(QObject):
         if data_text and (not reply.error() or status in (200, 206)):
             self.logsFetched.emit(data_text)
             self._debug(f"抓取成功 HTTP {status} {reason}，长度 {len(data_text)}")
+            # 输出调试指标
+            meta = self._req_meta.pop(id(reply), None)
+            if meta is not None:
+                cost_ms = int((time.time() - meta["t0"]) * 1000)
+                self.debugMessage.emit(
+                    f"[抓取完成] {meta['method']} {meta['url']}?{meta['query']} | 用时 {cost_ms}ms | 状态 {status}"
+                )
             reply.deleteLater()
             return
 
@@ -317,6 +337,128 @@ class ApiClient(QObject):
         snippet = ("；响应体：" + data_text[:300]) if data_text else ""
         self.requestFailed.emit(f"抓取失败：{reply.errorString()}{extra}{snippet}")
         self._debug(f"抓取失败 HTTP {status} {reason}：{data_text[:300]}")
+        # 输出调试指标
+        meta = self._req_meta.pop(id(reply), None)
+        if meta is not None:
+            cost_ms = int((time.time() - meta["t0"]) * 1000)
+            self.debugMessage.emit(
+                f"[抓取失败] {meta['method']} {meta['url']}?{meta['query']} | 用时 {cost_ms}ms | 错误 {reply.errorString()}"
+            )
+        reply.deleteLater()
+
+    def list_error_logs(self, page_size: int, page_num: int, creator: str) -> None:
+        """分页查询服务器已上报的错误追踪日志。
+
+        端点：POST /api/v1/manage/errorTraceLog/list/page
+        负载：{"pageSize":10, "pageNum":1, "creator":"..."}
+        """
+        if not self._host:
+            self.requestFailed.emit("Host 不能为空")
+            return
+
+        url = QUrl(self._host + "api/v1/manage/errorTraceLog/list/page")
+        request = QNetworkRequest(url)
+        request.setRawHeader(b"Accept", b"application/json")
+        request.setHeader(QNetworkRequest.ContentTypeHeader, "application/json")
+
+        if self._token:
+            request.setRawHeader(
+                b"Authorization", f"Bearer {self._token}".encode("utf-8")
+            )
+
+        payload_obj = {
+            "pageSize": int(page_size),
+            "pageNum": int(page_num),
+            "creator": creator or "",
+        }
+        payload = json.dumps(payload_obj, ensure_ascii=False).encode("utf-8")
+        self._debug(
+            f"分页查询 POST -> {url.toString()}\nbody: {payload[:512].decode('utf-8', errors='ignore')}"
+        )
+
+        start_ts = time.time()
+        reply = self._manager.post(request, QByteArray(payload))
+        self._attach_handlers(reply)
+        self._req_meta[id(reply)] = {
+            "t0": start_ts,
+            "method": "POST",
+            "url": url.toString(),
+            "bodyPreview": payload[:512].decode("utf-8", errors="ignore"),
+        }
+        self._debug(
+            f"分页查询 POST -> {url.toString()} | body: {self._req_meta[id(reply)]['bodyPreview']}"
+        )
+        reply.finished.connect(lambda r=reply: self._handle_list_reply(r))
+
+    def _handle_list_reply(self, reply: QNetworkReply) -> None:  # type: ignore[no-untyped-def]
+        status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
+        reason = reply.attribute(QNetworkRequest.HttpReasonPhraseAttribute)
+        data_text = bytes(reply.readAll()).decode("utf-8", errors="ignore")
+
+        # 尝试解析；若 data 为分页结构，提取列表字段合成为展示字符串
+        pretty = data_text
+        if data_text:
+            try:
+                obj = json.loads(data_text)
+                # 常见分页结构：{data:{records:[...]}} 或 {data:[...]} 或 {records:[...]}
+                records = None
+                if isinstance(obj, dict):
+                    data_field = obj.get("data")
+                    if isinstance(data_field, dict) and "records" in data_field:
+                        records = data_field.get("records")
+                    elif isinstance(data_field, list):
+                        records = data_field
+                    elif "records" in obj and isinstance(obj["records"], list):
+                        records = obj["records"]
+                if isinstance(records, list):
+                    pretty = json.dumps(records, ensure_ascii=False, indent=2)
+                else:
+                    pretty = json.dumps(obj, ensure_ascii=False, indent=2)
+            except (json.JSONDecodeError, ValueError):
+                pretty = data_text
+
+        if (pretty is not None) and (not reply.error() or status in (200, 206)):
+            # 若解析到 records 列表，向 UI 发送结构化数据用于 method/module 过滤
+            try:
+                obj = json.loads(data_text)
+                records = None
+                if isinstance(obj, dict):
+                    data_field = obj.get("data")
+                    if isinstance(data_field, dict) and isinstance(
+                        data_field.get("records"), list
+                    ):
+                        records = data_field.get("records")
+                    elif isinstance(data_field, list):
+                        records = data_field
+                    elif isinstance(obj.get("records"), list):
+                        records = obj.get("records")
+                if isinstance(records, list):
+                    self.recordsReceived.emit(records)
+            except (json.JSONDecodeError, ValueError, TypeError):  # 安全兜底，保持展示
+                pass
+            self.logsFetched.emit(pretty or "")
+            # 输出调试指标
+            meta = self._req_meta.pop(id(reply), None)
+            if meta is not None:
+                cost_ms = int((time.time() - meta["t0"]) * 1000)
+                self.debugMessage.emit(
+                    f"[分页完成] {meta['method']} {meta['url']} | 用时 {cost_ms}ms | 状态 {status}"
+                )
+            self._debug(f"分页查询成功 HTTP {status} {reason}，长度 {len(pretty)}")
+            reply.deleteLater()
+            return
+
+        extra = f" (HTTP {status} {reason})" if status else ""
+        snippet = ("；响应体：" + data_text[:300]) if data_text else ""
+        self.requestFailed.emit(f"分页查询失败：{reply.errorString()}{extra}{snippet}")
+        self._debug(f"分页查询失败 HTTP {status} {reason}：{data_text[:300]}")
+        # 输出调试指标
+        meta = self._req_meta.pop(id(reply), None)
+        if meta is not None:
+            cost_ms = int((time.time() - meta["t0"]) * 1000)
+            self.debugMessage.emit(
+                f"[分页失败] {meta['method']} {meta['url']} | 用时 {cost_ms}ms | 错误 {reply.errorString()}"
+            )
         reply.deleteLater()
 
 
@@ -338,11 +480,32 @@ class MainWindow(QMainWindow):
         self._api.logsFetched.connect(self._on_logs_fetched)
         self._api.requestFailed.connect(self._on_request_failed)
         self._api.debugMessage.connect(self._on_debug_message)
+        self._api.recordsReceived.connect(self._on_records_received)
 
         # 自动刷新定时器
         self._timer = QTimer(self)
         self._timer.setInterval(5000)
         self._timer.timeout.connect(self._on_timer_tick)
+        self._is_fetching: bool = False
+        self._last_shown_hash: int = 0
+        self._last_compiled_pattern: str = ""
+        self._last_compiled_flags: int = 0
+        self._compiled_regex = None
+        # 懒加载窗口化：仅渲染一部分行，滚动顶部再加载更多
+        self._lines_all: list[str] = []
+        self._window_start: int = 0
+        self._window_end: int = 0
+        self._chunk_lines: int = 2000
+        self._in_scroll_update: bool = False
+        self._last_records_for_filters: list[dict] = []
+        # 请求指标
+        self._req_meta: dict[int, dict] = {}
+
+        # 请求超时保护（避免用户感觉“没反应”）
+        self._requestTimer = QTimer(self)
+        self._requestTimer.setSingleShot(True)
+        self._requestTimer.setInterval(30000)  # 30s 超时
+        self._requestTimer.timeout.connect(self._on_request_timeout)
 
         # UI 组件
         central = QWidget(self)
@@ -415,6 +578,30 @@ class MainWindow(QMainWindow):
         btn_fetch.clicked.connect(self._on_click_fetch)
         grid_fetch.addWidget(btn_fetch, 2, 1)
 
+        # 分组：服务器分页查询
+        grp_query = QGroupBox("服务器分页查询", self)
+        grid_query = QGridLayout(grp_query)
+
+        self.pageSizeEdit = QSpinBox()
+        self.pageSizeEdit.setRange(1, 1000)
+        self.pageSizeEdit.setValue(10)
+        self.pageNumEdit = QSpinBox()
+        self.pageNumEdit.setRange(1, 100000)
+        self.pageNumEdit.setValue(1)
+        self.creatorEdit = QLineEdit()
+        self.creatorEdit.setPlaceholderText("示例：PSe5f3ffL006895")
+
+        grid_query.addWidget(QLabel("pageSize"), 0, 0)
+        grid_query.addWidget(self.pageSizeEdit, 0, 1)
+        grid_query.addWidget(QLabel("pageNum"), 0, 2)
+        grid_query.addWidget(self.pageNumEdit, 0, 3)
+        grid_query.addWidget(QLabel("creator"), 1, 0)
+        grid_query.addWidget(self.creatorEdit, 1, 1, 1, 3)
+
+        btn_query = QPushButton("分页查询一次")
+        btn_query.clicked.connect(self._on_click_query)
+        grid_query.addWidget(btn_query, 2, 3)
+
         # 分组：刷新与过滤
         grp_tools = QGroupBox("刷新与过滤", self)
         grid_tools = QGridLayout(grp_tools)
@@ -424,6 +611,11 @@ class MainWindow(QMainWindow):
         self.refreshSpin.setValue(5)
         grid_tools.addWidget(QLabel("自动刷新(秒)"), 0, 0)
         grid_tools.addWidget(self.refreshSpin, 0, 1)
+
+        self.refreshSourceCombo = QComboBox()
+        self.refreshSourceCombo.addItems(["抓取设备日志(fetch)", "服务器分页(list)"])
+        grid_tools.addWidget(QLabel("自动刷新来源"), 0, 2)
+        grid_tools.addWidget(self.refreshSourceCombo, 0, 3)
 
         btn_start = QPushButton("开始自动刷新")
         btn_stop = QPushButton("停止自动刷新")
@@ -443,6 +635,34 @@ class MainWindow(QMainWindow):
         self.caseCheck.setChecked(True)
         grid_tools.addWidget(self.caseCheck, 1, 2)
 
+        self.maxLinesSpin = QSpinBox()
+        self.maxLinesSpin.setRange(200, 200000)
+        self.maxLinesSpin.setValue(5000)
+        grid_tools.addWidget(QLabel("最大显示行数"), 1, 3)
+        grid_tools.addWidget(self.maxLinesSpin, 1, 4)
+        self.maxLinesSpin.valueChanged.connect(lambda _v: self._apply_filter_and_show())
+
+        # 新增：外部 method 过滤 与 内部模块过滤
+        self.methodCombo = QComboBox()
+        self.methodCombo.setEditable(False)
+        self.methodCombo.addItem("(全部方法)", "")
+        self.moduleCombo = QComboBox()
+        self.moduleCombo.setEditable(False)
+        self.moduleCombo.addItem("(全部模块)", "")
+        grid_tools.addWidget(QLabel("method"), 2, 0)
+        grid_tools.addWidget(self.methodCombo, 2, 1)
+        grid_tools.addWidget(QLabel("module"), 2, 2)
+        grid_tools.addWidget(self.moduleCombo, 2, 3)
+        btn_apply_filters = QPushButton("应用筛选")
+        btn_apply_filters.clicked.connect(self._apply_filter_and_show)
+        grid_tools.addWidget(btn_apply_filters, 2, 4)
+        self.methodCombo.currentIndexChanged.connect(
+            lambda _i: (self._save_filters(), self._apply_filter_and_show())
+        )
+        self.moduleCombo.currentIndexChanged.connect(
+            lambda _i: (self._save_filters(), self._apply_filter_and_show())
+        )
+
         # 分组：操作
         grp_actions = QGroupBox("操作", self)
         grid_actions = QGridLayout(grp_actions)
@@ -454,10 +674,24 @@ class MainWindow(QMainWindow):
         grid_actions.addWidget(btn_export, 0, 0)
         grid_actions.addWidget(btn_clear, 0, 1)
 
-        # 日志显示
+        # 日志显示与展开控制
+        expand_bar = QHBoxLayout()
+        self.expandBtn = QToolButton(self)
+        self.expandBtn.setText("展开日志")
+        self.expandBtn.setCheckable(True)
+        self.expandBtn.setToolTip("展开后仅显示日志区域，再次点击还原")
+        self.expandBtn.clicked.connect(self._on_toggle_expand)
+        expand_bar.addWidget(self.expandBtn)
+        expand_bar.addStretch(1)
+
         self.logView = QPlainTextEdit()
         self.logView.setReadOnly(True)
         self.logView.setLineWrapMode(QPlainTextEdit.NoWrap)
+        # 性能优化：禁用撤销/最大块数限制
+        self.logView.setUndoRedoEnabled(False)
+        self.logView.document().setMaximumBlockCount(0)  # 我们用自定义最大行控制
+        # 监听滚动，触顶懒加载更多
+        self.logView.verticalScrollBar().valueChanged.connect(self._on_log_scroll)
 
         # 工具栏：主题
         theme_action = QAction("切换主题", self)
@@ -472,9 +706,18 @@ class MainWindow(QMainWindow):
         # 布局（使用 Grid，遵循分组与对齐原则）
         layout.addWidget(grp_conn, 0, 0, 1, 2)
         layout.addWidget(grp_fetch, 1, 0, 1, 2)
-        layout.addWidget(grp_tools, 2, 0, 1, 2)
-        layout.addWidget(grp_actions, 3, 0, 1, 2)
-        layout.addWidget(self.logView, 4, 0, 1, 2)
+        layout.addWidget(grp_query, 2, 0, 1, 2)
+        layout.addWidget(grp_tools, 3, 0, 1, 2)
+        layout.addWidget(grp_actions, 4, 0, 1, 2)
+        layout.addLayout(expand_bar, 5, 0, 1, 2)
+        layout.addWidget(self.logView, 6, 0, 1, 2)
+        self._groups_for_expand = [
+            grp_conn,
+            grp_fetch,
+            grp_query,
+            grp_tools,
+            grp_actions,
+        ]
         self.setCentralWidget(central)
 
         # 载入设置
@@ -533,6 +776,19 @@ class MainWindow(QMainWindow):
             self._settings.value("conn/loginMode", "POST_JSON", str)
         )
         self.debugCheck.setChecked(self._settings.value("dev/debug", False, bool))
+        # 分页与来源
+        self.pageSizeEdit.setValue(self._settings.value("list/pageSize", 10, int))
+        self.pageNumEdit.setValue(self._settings.value("list/pageNum", 1, int))
+        self.creatorEdit.setText(
+            self._settings.value("list/creator", "PSe5f3ffL006895", str)
+        )
+        self.refreshSourceCombo.setCurrentText(
+            self._settings.value("fetch/source", "抓取设备日志(fetch)", str)
+        )
+        self.maxLinesSpin.setValue(self._settings.value("view/maxLines", 5000, int))
+        # 过滤器
+        self._last_records_for_filters = []
+        self._restore_filters()
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._settings.setValue("conn/host", self.hostEdit.text())
@@ -546,6 +802,13 @@ class MainWindow(QMainWindow):
         self._settings.setValue("conn/ignoreSsl", self.ignoreSslCheck.isChecked())
         self._settings.setValue("conn/loginMode", self.loginModeCombo.currentText())
         self._settings.setValue("dev/debug", self.debugCheck.isChecked())
+        # 分页与来源
+        self._settings.setValue("list/pageSize", self.pageSizeEdit.value())
+        self._settings.setValue("list/pageNum", self.pageNumEdit.value())
+        self._settings.setValue("list/creator", self.creatorEdit.text())
+        self._settings.setValue("fetch/source", self.refreshSourceCombo.currentText())
+        self._settings.setValue("view/maxLines", self.maxLinesSpin.value())
+        self._save_filters()
         super().closeEvent(event)
 
     # --------------------- 事件处理 ---------------------
@@ -581,6 +844,9 @@ class MainWindow(QMainWindow):
             self._error(f"登录失败：{result.error_message}")
 
     def _on_click_fetch(self) -> None:
+        if self._is_fetching:
+            self._status.showMessage("已有请求进行中，请稍候…", 3000)
+            return
         host = self.hostEdit.text().strip()
         device_id = self.deviceEdit.text().strip()
         log_path = self.pathEdit.text().strip()
@@ -598,16 +864,121 @@ class MainWindow(QMainWindow):
         )
         self._api.set_host(host)
         self._api.set_token(token)
-        self._status.showMessage("正在抓取日志…", 2000)
+        # 状态提示保持到数据展示/错误出现后再自动被覆盖
+        self._status.showMessage("正在抓取日志…")
+        self._is_fetching = True
+        self._requestTimer.start()
         self._api.fetch_logs(device_id, log_path)
+
+    def _on_click_query(self) -> None:
+        if self._is_fetching:
+            self._status.showMessage("已有请求进行中，请稍候…", 3000)
+            return
+        host = self.hostEdit.text().strip()
+        if not host:
+            self._warn("请填写 Host。")
+            return
+
+        token = self.tokenEdit.text().strip()
+        self._api.set_options(
+            ignore_ssl_errors=self.ignoreSslCheck.isChecked(),
+            prefer_https_default=self.preferHttpsCheck.isChecked(),
+            debug_enabled=self.debugCheck.isChecked(),
+        )
+        self._api.set_host(host)
+        self._api.set_token(token)
+        page_size = int(self.pageSizeEdit.value())
+        page_num = int(self.pageNumEdit.value())
+        creator = self.creatorEdit.text().strip()
+        # 状态提示保持到数据展示/错误出现后再自动被覆盖
+        self._status.showMessage("正在进行分页查询…")
+        self._is_fetching = True
+        # 清空旧窗口，避免残留
+        self._lines_all = []
+        self._window_start = 0
+        self._window_end = 0
+        self.logView.clear()
+        self._requestTimer.start()
+        self._api.list_error_logs(page_size, page_num, creator)
 
     def _on_logs_fetched(self, text: str) -> None:
         self._status.showMessage("日志抓取成功", 2000)
-        self._raw_text = text  # 原始文本用于过滤
-        self._apply_filter_and_show()
+        self._raw_text = text or ""  # 原始文本用于过滤
+        try:
+            self._apply_filter_and_show()
+        finally:
+            self._is_fetching = False
+            if self._requestTimer.isActive():
+                self._requestTimer.stop()
 
     def _on_request_failed(self, message: str) -> None:
-        self._error(message)
+        try:
+            self._error(message)
+        finally:
+            self._is_fetching = False
+            if self._requestTimer.isActive():
+                self._requestTimer.stop()
+
+    def _on_request_timeout(self) -> None:
+        # 超时兜底：复位状态并给出提示
+        self._is_fetching = False
+        self._status.showMessage("请求超时，请重试或检查网络。", 5000)
+
+    # ------ 接收结构化 records，填充 method/module 过滤项 ------
+    def _on_records_received(self, records: object) -> None:
+        if not isinstance(records, list):
+            return
+        self._last_records_for_filters = records
+        methods = set()
+        modules = set()
+        for item in records:
+            if isinstance(item, dict):
+                m = item.get("method")
+                if isinstance(m, str) and m:
+                    methods.add(m)
+                # errorMsg 可能是 JSON 字符串，内部键是模块名
+                em = item.get("errorMsg")
+                if isinstance(em, str) and em:
+                    try:
+                        em_obj = json.loads(em)
+                        if isinstance(em_obj, dict):
+                            for k in em_obj.keys():
+                                if isinstance(k, str) and k:
+                                    modules.add(k)
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        pass
+
+        # 刷新下拉：保留“全部”项
+        def refill(combo: QComboBox, values: set[str]) -> None:
+            current = combo.currentData()
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("(全部)", "")
+            for v in sorted(values):
+                combo.addItem(v, v)
+            # 恢复之前所选（若仍存在）
+            idx = combo.findData(current)
+            combo.setCurrentIndex(idx if idx >= 0 else 0)
+            combo.blockSignals(False)
+
+        refill(self.methodCombo, methods)
+        refill(self.moduleCombo, modules)
+        # 若存在上一轮的选择，从设置恢复
+        self._restore_filters()
+
+    def _save_filters(self) -> None:
+        self._settings.setValue("filter/method", self.methodCombo.currentData() or "")
+        self._settings.setValue("filter/module", self.moduleCombo.currentData() or "")
+
+    def _restore_filters(self) -> None:
+        method = self._settings.value("filter/method", "", str)
+        module = self._settings.value("filter/module", "", str)
+        idx_m = self.methodCombo.findData(method)
+        if idx_m >= 0:
+            self.methodCombo.setCurrentIndex(idx_m)
+        idx_mod = self.moduleCombo.findData(module)
+        if idx_mod >= 0:
+            self.moduleCombo.setCurrentIndex(idx_mod)
 
     def _on_click_start_auto(self) -> None:
         seconds = int(self.refreshSpin.value())
@@ -622,8 +993,12 @@ class MainWindow(QMainWindow):
         self._status.showMessage("已停止自动刷新", 2000)
 
     def _on_timer_tick(self) -> None:
-        # 自动调用抓取逻辑
-        self._on_click_fetch()
+        # 根据选择的数据源执行自动刷新
+        src = self.refreshSourceCombo.currentText()
+        if src.startswith("抓取"):
+            self._on_click_fetch()
+        else:
+            self._on_click_query()
 
     def _on_click_export(self) -> None:
         text = self.logView.toPlainText()
@@ -653,20 +1028,149 @@ class MainWindow(QMainWindow):
         text = self._raw_text or ""
         pattern = self.regexEdit.text().strip()
         if not text:
+            self._lines_all = []
+            self._window_start = 0
+            self._window_end = 0
             self.logView.setPlainText("")
             return
-        if not pattern:
-            self.logView.setPlainText(text)
-            return
+
+        # 计算内容哈希，避免重复渲染
+        new_hash = hash(text)
+
+        # 编译/复用正则
+        compiled = None
+        if pattern:
+            try:
+                flags = re.IGNORECASE if self.caseCheck.isChecked() else 0
+                if (
+                    self._compiled_regex is not None
+                    and self._last_compiled_pattern == pattern
+                    and self._last_compiled_flags == flags
+                ):
+                    compiled = self._compiled_regex
+                else:
+                    compiled = re.compile(pattern, flags)
+                    self._compiled_regex = compiled
+                    self._last_compiled_pattern = pattern
+                    self._last_compiled_flags = flags
+            except re.error as exc:
+                self._error(f"正则错误：{exc}")
+                return
+
+        # 结构化过滤：基于 method 与 module 从 records 中生成文本（若可用）
+        selected_method = self.methodCombo.currentData() or ""
+        selected_module = self.moduleCombo.currentData() or ""
+        structured_lines = None
         try:
-            flags = re.IGNORECASE if self.caseCheck.isChecked() else 0
-            compiled = re.compile(pattern, flags)
-            lines = text.splitlines()
-            matched = [ln for ln in lines if compiled.search(ln)]
-            self.logView.setPlainText("\n".join(matched))
-            self._status.showMessage(f"过滤后行数：{len(matched)}", 2000)
-        except re.error as exc:
-            self._error(f"正则错误：{exc}")
+            # 如果上一轮收到过 records，则按筛选生成
+            if self._last_records_for_filters:
+                buf: list[str] = []
+                for item in self._last_records_for_filters:
+                    if not isinstance(item, dict):
+                        continue
+                    if selected_method and item.get("method") != selected_method:
+                        continue
+                    em = item.get("errorMsg")
+                    if isinstance(em, str) and em:
+                        try:
+                            em_obj = json.loads(em)
+                            if isinstance(em_obj, dict):
+                                # 仅输出选定模块或全部模块
+                                keys = (
+                                    [selected_module]
+                                    if selected_module
+                                    else list(em_obj.keys())
+                                )
+                                for k in keys:
+                                    if not k:
+                                        continue
+                                    val = em_obj.get(k)
+                                    if isinstance(val, list):
+                                        buf.extend(str(x).rstrip("\n") for x in val)
+                                    elif isinstance(val, str):
+                                        buf.extend(val.splitlines())
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+                structured_lines = buf
+        except (TypeError, AttributeError):
+            structured_lines = None
+
+        # 若无法按结构化解析，则按原有正则过滤
+        if structured_lines is None or len(structured_lines) == 0:
+            all_lines = (
+                text.splitlines()
+                if compiled is None
+                else [ln for ln in text.splitlines() if compiled.search(ln)]
+            )
+        else:
+            all_lines = structured_lines
+        self._lines_all = all_lines
+
+        # 仅取窗口：默认显示最后 max_lines 行
+        max_lines = int(self.maxLinesSpin.value())
+        end = len(all_lines)
+        start = max(0, end - max_lines)
+        self._window_start = start
+        self._window_end = end
+        window_lines = all_lines[start:end]
+        new_text = "\n".join(window_lines)
+
+        # 仅当文本不同再刷新，减少闪烁
+        if new_text != self.logView.toPlainText() or new_hash != self._last_shown_hash:
+            scrollbar = self.logView.verticalScrollBar()
+            at_bottom = (
+                scrollbar.value() >= scrollbar.maximum() - 2 if scrollbar else False
+            )
+
+            self.logView.setPlainText(new_text)
+            self._last_shown_hash = new_hash
+
+            if at_bottom:
+                scrollbar.setValue(scrollbar.maximum())
+
+        self._status.showMessage(
+            f"显示行数：{len(window_lines)} / 总行数：{len(all_lines)}", 1500
+        )
+
+    def _on_log_scroll(self, _val: int) -> None:
+        # 仅当滚动到顶部时，尝试向上扩展窗口
+        if self._in_scroll_update:
+            return
+        sb = self.logView.verticalScrollBar()
+        if not sb or sb.value() > sb.minimum():
+            return
+        if not self._lines_all:
+            return
+
+        # 计算向上扩展量（改为窗口滑动：保持窗口大小为 max_lines，整体上移）
+        grow = min(self._chunk_lines, self._window_start)
+        if grow <= 0:
+            return
+
+        max_lines = int(self.maxLinesSpin.value())
+        new_start = max(0, self._window_start - grow)
+        # 窗口大小尽量保持在 max_lines
+        new_end = min(len(self._lines_all), new_start + max_lines)
+        # 若剩余不足 max_lines，则尽量扩到最早
+        if new_start == 0:
+            new_end = min(len(self._lines_all), max_lines)
+
+        window_lines = self._lines_all[new_start:new_end]
+        new_text = "\n".join(window_lines)
+
+        # 记录旧滚动状态，用于平滑过渡
+        # 顶部扩展：保持视图仍接近顶部，便于连续上滑加载
+        # 这里将滚动值设置为一个很小的值而非 0，避免重复触发
+
+        self._in_scroll_update = True
+        try:
+            self.logView.setPlainText(new_text)
+            self._window_start = new_start
+            self._window_end = new_end
+            # 把视口保持在加载前的位置附近：将滚动条置顶附近，避免反复触发但保留用户继续上滑
+            sb.setValue(min(sb.maximum(), sb.minimum() + 2))
+        finally:
+            self._in_scroll_update = False
 
     # --------------------- 统一反馈 ---------------------
     def _ok(self, message: str) -> None:
@@ -685,6 +1189,15 @@ class MainWindow(QMainWindow):
             # 仅在开启时弹窗提示，同时写入状态栏
             self._status.showMessage(message, 5000)
             QMessageBox.information(self, "调试", message)
+
+    # --------------------- 展开/还原 日志区域 ---------------------
+    def _on_toggle_expand(self, checked: bool) -> None:
+        # 根据状态隐藏/显示其他分组，最大化日志可视区域
+        for grp in getattr(self, "_groups_for_expand", []):
+            grp.setVisible(not checked)
+        self.expandBtn.setText("还原布局" if checked else "展开日志")
+        # 提示并微调状态栏
+        self._status.showMessage("已展开日志区域" if checked else "已还原布局", 2000)
 
 
 def main() -> None:
