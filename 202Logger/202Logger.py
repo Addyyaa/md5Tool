@@ -634,6 +634,9 @@ class MainWindow(QMainWindow):
         self.caseCheck = QCheckBox("不区分大小写")
         self.caseCheck.setChecked(True)
         grid_tools.addWidget(self.caseCheck, 1, 2)
+        # 正则与大小写变化时，实时应用
+        self.regexEdit.textChanged.connect(self._apply_filter_and_show)
+        self.caseCheck.toggled.connect(lambda _v: self._apply_filter_and_show())
 
         self.maxLinesSpin = QSpinBox()
         self.maxLinesSpin.setRange(200, 200000)
@@ -1095,15 +1098,17 @@ class MainWindow(QMainWindow):
         except (TypeError, AttributeError):
             structured_lines = None
 
-        # 若无法按结构化解析，则按原有正则过滤
+        # 先确定基础行集（结构化优先；否则原始文本分行）
         if structured_lines is None or len(structured_lines) == 0:
-            all_lines = (
-                text.splitlines()
-                if compiled is None
-                else [ln for ln in text.splitlines() if compiled.search(ln)]
-            )
+            base_lines = text.splitlines()
         else:
-            all_lines = structured_lines
+            base_lines = structured_lines
+
+        # 再进行正则后置过滤
+        if compiled is None:
+            all_lines = base_lines
+        else:
+            all_lines = [ln for ln in base_lines if compiled.search(ln)]
         self._lines_all = all_lines
 
         # 仅取窗口：默认显示最后 max_lines 行

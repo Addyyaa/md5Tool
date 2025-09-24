@@ -10,4 +10,7 @@ md5Tool/
 assets/
 venv/
 png
+*.exe
+*.pkg
+*.xml
 
