@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import re
 from dataclasses import dataclass
+import datetime as _dt
 import time
 from typing import Optional
 
@@ -28,6 +29,7 @@ from PySide6.QtCore import (
     QUrlQuery,
     QByteArray,
     Signal,
+    Qt,
 )
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtNetwork import (
@@ -661,6 +663,12 @@ class MainWindow(QMainWindow):
         grid_tools.addWidget(self.methodCombo, 2, 1)
         grid_tools.addWidget(QLabel("module"), 2, 2)
         grid_tools.addWidget(self.moduleCombo, 2, 3)
+        # 创建时间筛选（下拉，自动聚合）
+        self.createTimeCombo = QComboBox()
+        self.createTimeCombo.setEditable(False)
+        grid_tools.addWidget(QLabel("createTime"), 3, 0)
+        grid_tools.addWidget(self.createTimeCombo, 3, 1, 1, 3)
+
         btn_apply_filters = QPushButton("应用筛选")
         btn_apply_filters.clicked.connect(self._apply_filter_and_show)
         grid_tools.addWidget(btn_apply_filters, 2, 4)
@@ -668,6 +676,9 @@ class MainWindow(QMainWindow):
             lambda _i: (self._save_filters(), self._apply_filter_and_show())
         )
         self.moduleCombo.currentIndexChanged.connect(
+            lambda _i: (self._save_filters(), self._apply_filter_and_show())
+        )
+        self.createTimeCombo.currentIndexChanged.connect(
             lambda _i: (self._save_filters(), self._apply_filter_and_show())
         )
 
@@ -797,6 +808,12 @@ class MainWindow(QMainWindow):
         # 过滤器
         self._last_records_for_filters = []
         self._restore_filters()
+        # 恢复时间筛选（下拉）
+        sel_ct = self._settings.value("filter/createTime", "", str)
+        if sel_ct:
+            idx_ct = self.createTimeCombo.findData(sel_ct)
+            if idx_ct >= 0:
+                self.createTimeCombo.setCurrentIndex(idx_ct)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
         self._settings.setValue("conn/host", self.hostEdit.text())
@@ -817,6 +834,10 @@ class MainWindow(QMainWindow):
         self._settings.setValue("fetch/source", self.refreshSourceCombo.currentText())
         self._settings.setValue("view/maxLines", self.maxLinesSpin.value())
         self._save_filters()
+        # 保存时间筛选
+        self._settings.setValue(
+            "filter/createTime", self.createTimeCombo.currentData() or ""
+        )
         super().closeEvent(event)
 
     # --------------------- 事件处理 ---------------------
@@ -939,11 +960,15 @@ class MainWindow(QMainWindow):
         self._last_records_for_filters = records
         methods = set()
         modules = set()
+        times = []
         for item in records:
             if isinstance(item, dict):
                 m = item.get("method")
                 if isinstance(m, str) and m:
                     methods.add(m)
+                ct = item.get("createTime")
+                if isinstance(ct, str) and ct:
+                    times.append(ct)
                 # errorMsg 可能是 JSON 字符串，内部键是模块名
                 em = item.get("errorMsg")
                 if isinstance(em, str) and em:
@@ -971,6 +996,23 @@ class MainWindow(QMainWindow):
 
         refill(self.methodCombo, methods)
         refill(self.moduleCombo, modules)
+        # createTime 下拉：首项(全部)，其余按时间倒序，文本过长不自动换行
+        current_ct = self.createTimeCombo.currentData()
+        self.createTimeCombo.blockSignals(True)
+        self.createTimeCombo.clear()
+        self.createTimeCombo.addItem("(全部时间)", "")
+        for t in sorted(set(times), reverse=True):
+            # 本地时间显示，data 保留原始值
+            local_str = self._to_local_display_time(t)
+            display = local_str if len(local_str) <= 30 else (local_str[:27] + "…")
+            self.createTimeCombo.addItem(display, t)
+            self.createTimeCombo.setItemData(
+                self.createTimeCombo.count() - 1, local_str, Qt.ToolTipRole
+            )
+        # 恢复之前所选
+        idx = self.createTimeCombo.findData(current_ct)
+        self.createTimeCombo.setCurrentIndex(idx if idx >= 0 else 0)
+        self.createTimeCombo.blockSignals(False)
         # 若存在上一轮的选择，从设置恢复
         self._restore_filters()
 
@@ -987,6 +1029,26 @@ class MainWindow(QMainWindow):
         idx_mod = self.moduleCombo.findData(module)
         if idx_mod >= 0:
             self.moduleCombo.setCurrentIndex(idx_mod)
+
+    # ---------- 工具：将 ISO8601/字符串时间转换成本地可读时间 ----------
+    def _to_local_display_time(self, iso_text: str) -> str:
+        # 常见格式：2025-09-24T07:35:45.000+0000 或 2025-09-24T07:35:45+00:00
+        text = (iso_text or "").strip()
+        if not text:
+            return ""
+        try:
+            # 统一 +0000 => +00:00
+            norm = text
+            if len(text) >= 5 and (text.endswith("+0000") or text.endswith("-0000")):
+                norm = text[:-5] + text[-5:-2] + ":" + text[-2:]
+            dt = _dt.datetime.fromisoformat(norm.replace("Z", "+00:00"))
+            # 若无 tzinfo，按本地时间返回
+            if dt.tzinfo is None:
+                return dt.strftime("%Y-%m-%d %H:%M:%S")
+            local_dt = dt.astimezone()
+            return local_dt.strftime("%Y-%m-%d %H:%M:%S")
+        except Exception:
+            return text
 
     def _on_click_start_auto(self) -> None:
         seconds = int(self.refreshSpin.value())
@@ -1073,8 +1135,14 @@ class MainWindow(QMainWindow):
             # 如果上一轮收到过 records，则按筛选生成
             if self._last_records_for_filters:
                 buf: list[str] = []
+                # 解析 createTime 精确筛选
+                select_ct = self.createTimeCombo.currentData() or ""
+
                 for item in self._last_records_for_filters:
                     if not isinstance(item, dict):
+                        continue
+                    # createTime 等值过滤
+                    if select_ct and item.get("createTime") != select_ct:
                         continue
                     if selected_method and item.get("method") != selected_method:
                         continue
