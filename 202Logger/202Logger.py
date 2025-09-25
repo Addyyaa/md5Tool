@@ -19,6 +19,11 @@ import re
 from dataclasses import dataclass
 import datetime as _dt
 import time
+import sys
+import traceback
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import (
@@ -30,6 +35,7 @@ from PySide6.QtCore import (
     QByteArray,
     Signal,
     Qt,
+    qInstallMessageHandler,
 )
 from PySide6.QtGui import QAction, QIcon
 from PySide6.QtNetwork import (
@@ -896,6 +902,13 @@ class MainWindow(QMainWindow):
         # 状态提示保持到数据展示/错误出现后再自动被覆盖
         self._status.showMessage("正在抓取日志…")
         self._is_fetching = True
+        # 抓取与分页查询为不同来源，清空结构化记录，避免旧 records 干扰
+        self._last_records_for_filters = []
+        # 清空窗口化缓存，避免残留引发滚动计算异常
+        self._lines_all = []
+        self._window_start = 0
+        self._window_end = 0
+        self.logView.clear()
         self._requestTimer.start()
         self._api.fetch_logs(device_id, log_path)
 
@@ -931,10 +944,17 @@ class MainWindow(QMainWindow):
         self._api.list_error_logs(page_size, page_num, creator)
 
     def _on_logs_fetched(self, text: str) -> None:
-        self._status.showMessage("日志抓取成功", 2000)
-        self._raw_text = text or ""  # 原始文本用于过滤
         try:
+            self._status.showMessage("日志抓取成功", 2000)
+            self._raw_text = text or ""  # 原始文本用于过滤
             self._apply_filter_and_show()
+        except (
+            RuntimeError,
+            ValueError,
+            TypeError,
+        ) as exc:  # 安全兜底，避免 UI 渲染异常导致崩溃
+            err = "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
+            self._error(f"渲染日志时发生异常，已中止本次更新。\n{err}")
         finally:
             self._is_fetching = False
             if self._requestTimer.isActive():
@@ -1047,7 +1067,7 @@ class MainWindow(QMainWindow):
                 return dt.strftime("%Y-%m-%d %H:%M:%S")
             local_dt = dt.astimezone()
             return local_dt.strftime("%Y-%m-%d %H:%M:%S")
-        except Exception:
+        except (ValueError, TypeError):
             return text
 
     def _on_click_start_auto(self) -> None:
@@ -1280,14 +1300,64 @@ class MainWindow(QMainWindow):
     # --------------------- 展开/还原 日志区域 ---------------------
     def _on_toggle_expand(self, checked: bool) -> None:
         # 根据状态隐藏/显示其他分组，最大化日志可视区域
-        for grp in getattr(self, "_groups_for_expand", []):
-            grp.setVisible(not checked)
-        self.expandBtn.setText("还原布局" if checked else "展开日志")
-        # 提示并微调状态栏
-        self._status.showMessage("已展开日志区域" if checked else "已还原布局", 2000)
+        try:
+            for grp in getattr(self, "_groups_for_expand", []):
+                grp.setVisible(not checked)
+            self.expandBtn.setText("还原布局" if checked else "展开日志")
+            # 展开时，若当前仍在请求中，避免连续渲染导致的 UI 抖动
+            if checked and self._is_fetching:
+                self._status.showMessage("正在请求中，已展开日志区域。", 2000)
+            else:
+                self._status.showMessage(
+                    "已展开日志区域" if checked else "已还原布局", 2000
+                )
+        except (RuntimeError, ValueError, TypeError) as exc:
+            # 防护：控件在关闭或切换时可能已被 Qt 回收
+            msg = f"展开/还原操作异常：{exc}"
+            # 仅状态栏提示，避免打断用户
+            self._status.showMessage(msg, 3000)
 
 
 def main() -> None:
+    # 全局：文件日志（含轮转），同时打印到控制台
+    log_dir = Path(__file__).resolve().parent
+    log_path = log_dir / "202Logger.log"
+    logger = logging.getLogger("202Logger")
+    logger.setLevel(logging.DEBUG)
+    if not logger.handlers:
+        file_handler = RotatingFileHandler(
+            str(log_path), maxBytes=2_000_000, backupCount=2, encoding="utf-8"
+        )
+        file_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        )
+        stream_handler = logging.StreamHandler(sys.stdout)
+        stream_handler.setFormatter(
+            logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+        )
+        logger.addHandler(file_handler)
+        logger.addHandler(stream_handler)
+
+    # 全局：Qt 消息捕获，转发到控制台与文件，便于定位“无报错崩溃”
+    def _qt_message_handler(mode, context, message):  # type: ignore[no-untyped-def]
+        file = getattr(context, "file", "?")
+        line = getattr(context, "line", "?")
+        msg = f"[Qt:{mode}] {message} ({file}:{line})"
+        print(msg)
+        logger.error(msg)
+
+    qInstallMessageHandler(_qt_message_handler)
+
+    # 全局：未捕获异常保护，弹窗并写控制台，避免静默崩溃
+    def _excepthook(exc_type, exc, tb):  # type: ignore[no-untyped-def]
+        err = "".join(traceback.format_exception(exc_type, exc, tb))
+        logger.exception("未捕获异常：%s", err)
+        if QApplication.instance() is not None:
+            QMessageBox.critical(None, "错误", f"未捕获异常\n{err}")
+        print(err, file=sys.stderr)
+
+    sys.excepthook = _excepthook
+
     app = QApplication([])
     win = MainWindow()
     win.resize(1000, 700)
