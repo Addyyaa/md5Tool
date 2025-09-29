@@ -22,9 +22,16 @@ import time
 import sys
 import traceback
 import logging
+import faulthandler
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Optional
+
+# 对象有效性检测（避免使用已销毁的 Qt 对象）
+try:
+    from shiboken6 import shiboken6 as _sbk  # type: ignore
+except Exception:  # pragma: no cover
+    _sbk = None
 
 from PySide6.QtCore import (
     QObject,
@@ -34,7 +41,9 @@ from PySide6.QtCore import (
     QUrlQuery,
     QByteArray,
     Signal,
+    Slot,
     Qt,
+    QEvent,
     qInstallMessageHandler,
 )
 from PySide6.QtGui import QAction, QIcon
@@ -101,6 +110,8 @@ class ApiClient(QObject):
         self.last_password: str = ""
         self._debug_enabled: bool = False
         self._req_meta: dict[int, dict] = {}
+        # 记录当前分页查询的进行中请求，防止并发导致崩溃
+        self._current_list_reply: Optional[QNetworkReply] = None
         # 使用 CookieJar 维持会话（部分接口将 token 写入 Set-Cookie）
         self._manager.setCookieJar(QNetworkCookieJar(self))
         # 处理 HTTP 基本认证（如网关 401）
@@ -146,10 +157,12 @@ class ApiClient(QObject):
         if hasattr(reply, "sslErrors"):
             reply.sslErrors.connect(lambda _errs, r=reply: self._on_ssl_errors(r))  # type: ignore[attr-defined]
 
+    @Slot(object)
     def _on_ssl_errors(self, reply) -> None:  # type: ignore[no-untyped-def]
         if self._ignore_ssl_errors and hasattr(reply, "ignoreSslErrors"):
             reply.ignoreSslErrors()  # type: ignore[attr-defined]
 
+    @Slot(object, QAuthenticator)
     def _on_auth_required(self, _reply, authenticator: QAuthenticator) -> None:  # type: ignore[no-untyped-def]
         # 若服务器要求 Basic/Digest 认证，使用登录输入的用户名密码
         # 注意：这是与登录接口不同层的网关认证
@@ -329,7 +342,7 @@ class ApiClient(QObject):
 
         # 即便 Qt 报 Unknown error，只要 HTTP 200/206 且拿到内容，优先展示日志
         if data_text and (not reply.error() or status in (200, 206)):
-            self.logsFetched.emit(data_text)
+            QTimer.singleShot(0, lambda t=data_text: self.logsFetched.emit(t))
             self._debug(f"抓取成功 HTTP {status} {reason}，长度 {len(data_text)}")
             # 输出调试指标
             meta = self._req_meta.pop(id(reply), None)
@@ -384,6 +397,17 @@ class ApiClient(QObject):
             f"分页查询 POST -> {url.toString()}\nbody: {payload[:512].decode('utf-8', errors='ignore')}"
         )
 
+        # 若已有进行中的分页请求，先中止它，避免并发响应交叉导致 UI 崩溃
+        cur = getattr(self, "_current_list_reply", None)
+        if cur is not None:
+            try:
+                if hasattr(cur, "isFinished") and not cur.isFinished():
+                    if hasattr(cur, "abort"):
+                        cur.abort()
+            except (RuntimeError, AttributeError):
+                # 句柄已失效或已被 Qt 回收
+                pass
+
         start_ts = time.time()
         reply = self._manager.post(request, QByteArray(payload))
         self._attach_handlers(reply)
@@ -396,7 +420,20 @@ class ApiClient(QObject):
         self._debug(
             f"分页查询 POST -> {url.toString()} | body: {self._req_meta[id(reply)]['bodyPreview']}"
         )
-        reply.finished.connect(lambda r=reply: self._handle_list_reply(r))
+        self._current_list_reply = reply
+
+        # 连接一次性槽函数，防止 Qt 重复触发导致重入
+        def _on_finished_once(r=reply) -> None:
+            try:
+                # 仅断开当前槽，避免影响其他连接
+                reply.finished.disconnect(_on_finished_once)
+            except (TypeError, RuntimeError):
+                pass
+            # 将后续处理投递到主线程事件队列，防止在网络线程直接触碰 UI
+            QApplication.postEvent(self, QEvent(QEvent.User))  # 触发事件循环
+            self._handle_list_reply(r)
+
+        reply.finished.connect(_on_finished_once)
 
     def _handle_list_reply(self, reply: QNetworkReply) -> None:  # type: ignore[no-untyped-def]
         status = reply.attribute(QNetworkRequest.HttpStatusCodeAttribute)
@@ -449,7 +486,8 @@ class ApiClient(QObject):
                     self.recordsReceived.emit(records)
             except (json.JSONDecodeError, ValueError, TypeError):  # 安全兜底，保持展示
                 pass
-            self.logsFetched.emit(pretty or "")
+            # 将 UI 更新放入主线程事件队列，避免网络线程直接调用槽
+            QTimer.singleShot(0, lambda p=pretty or "": self.logsFetched.emit(p))
             # 输出调试指标
             meta = self._req_meta.pop(id(reply), None)
             if meta is not None:
@@ -458,6 +496,9 @@ class ApiClient(QObject):
                     f"[分页完成] {meta['method']} {meta['url']} | 用时 {cost_ms}ms | 状态 {status}"
                 )
             self._debug(f"分页查询成功 HTTP {status} {reason}，长度 {len(pretty)}")
+            # 清理当前请求句柄
+            if getattr(self, "_current_list_reply", None) is reply:
+                self._current_list_reply = None
             reply.deleteLater()
             return
 
@@ -472,6 +513,9 @@ class ApiClient(QObject):
             self.debugMessage.emit(
                 f"[分页失败] {meta['method']} {meta['url']} | 用时 {cost_ms}ms | 错误 {reply.errorString()}"
             )
+        # 清理当前请求句柄
+        if getattr(self, "_current_list_reply", None) is reply:
+            self._current_list_reply = None
         reply.deleteLater()
 
 
@@ -489,11 +533,18 @@ class MainWindow(QMainWindow):
 
         # API 客户端
         self._api = ApiClient(self)
-        self._api.loginFinished.connect(self._on_login_finished)
-        self._api.logsFetched.connect(self._on_logs_fetched)
-        self._api.requestFailed.connect(self._on_request_failed)
-        self._api.debugMessage.connect(self._on_debug_message)
-        self._api.recordsReceived.connect(self._on_records_received)
+        # 强制使用 QueuedConnection，保证 UI 更新发生在主线程消息队列
+        self._api.loginFinished.connect(
+            self._on_login_finished, type=Qt.QueuedConnection
+        )
+        self._api.logsFetched.connect(self._on_logs_fetched, type=Qt.QueuedConnection)
+        self._api.requestFailed.connect(
+            self._on_request_failed, type=Qt.QueuedConnection
+        )
+        self._api.debugMessage.connect(self._on_debug_message, type=Qt.QueuedConnection)
+        self._api.recordsReceived.connect(
+            self._on_records_received, type=Qt.QueuedConnection
+        )
 
         # 自动刷新定时器
         self._timer = QTimer(self)
@@ -510,9 +561,23 @@ class MainWindow(QMainWindow):
         self._window_end: int = 0
         self._chunk_lines: int = 2000
         self._in_scroll_update: bool = False
+        self._in_render: bool = False
         self._last_records_for_filters: list[dict] = []
         # 请求指标
         self._req_meta: dict[int, dict] = {}
+
+        # 帮助函数：判断 Qt 对象是否仍然有效
+        def _is_alive(obj: object) -> bool:
+            if obj is None:
+                return False
+            if _sbk is None:
+                return True
+            try:
+                return bool(_sbk.isValid(obj))
+            except Exception:
+                return False
+
+        self._is_alive = _is_alive  # 绑定为实例方法供内部使用
 
         # 请求超时保护（避免用户感觉“没反应”）
         self._requestTimer = QTimer(self)
@@ -590,6 +655,7 @@ class MainWindow(QMainWindow):
         btn_fetch = QPushButton("抓取一次")
         btn_fetch.clicked.connect(self._on_click_fetch)
         grid_fetch.addWidget(btn_fetch, 2, 1)
+        self._btn_fetch = btn_fetch
 
         # 分组：服务器分页查询
         grp_query = QGroupBox("服务器分页查询", self)
@@ -614,6 +680,7 @@ class MainWindow(QMainWindow):
         btn_query = QPushButton("分页查询一次")
         btn_query.clicked.connect(self._on_click_query)
         grid_query.addWidget(btn_query, 2, 3)
+        self._btn_query = btn_query
 
         # 分组：刷新与过滤
         grp_tools = QGroupBox("刷新与过滤", self)
@@ -638,6 +705,8 @@ class MainWindow(QMainWindow):
         row0.addWidget(btn_start)
         row0.addWidget(btn_stop)
         grid_tools.addLayout(row0, 0, 2)
+        self._btn_start = btn_start
+        self._btn_stop = btn_stop
 
         self.regexEdit = QLineEdit()
         self.regexEdit.setPlaceholderText("输入正则以过滤显示（留空显示全部）")
@@ -647,16 +716,25 @@ class MainWindow(QMainWindow):
         self.caseCheck = QCheckBox("不区分大小写")
         self.caseCheck.setChecked(True)
         grid_tools.addWidget(self.caseCheck, 1, 2)
+
         # 正则与大小写变化时，实时应用
-        self.regexEdit.textChanged.connect(self._apply_filter_and_show)
-        self.caseCheck.toggled.connect(lambda _v: self._apply_filter_and_show())
+        # 防止频繁文本变化导致的重入；加一个轻量去抖
+        def _on_regex_changed(_text: str) -> None:
+            self._renderTimer.start(0)
+
+        self.regexEdit.textChanged.connect(_on_regex_changed)
+
+        def _on_case_toggled(_v: bool) -> None:
+            self._renderTimer.start(0)
+
+        self.caseCheck.toggled.connect(_on_case_toggled)
 
         self.maxLinesSpin = QSpinBox()
         self.maxLinesSpin.setRange(200, 200000)
         self.maxLinesSpin.setValue(5000)
         grid_tools.addWidget(QLabel("最大显示行数"), 1, 3)
         grid_tools.addWidget(self.maxLinesSpin, 1, 4)
-        self.maxLinesSpin.valueChanged.connect(lambda _v: self._apply_filter_and_show())
+        self.maxLinesSpin.valueChanged.connect(lambda _v: self._renderTimer.start(0))
 
         # 新增：外部 method 过滤 与 内部模块过滤
         self.methodCombo = QComboBox()
@@ -676,17 +754,16 @@ class MainWindow(QMainWindow):
         grid_tools.addWidget(self.createTimeCombo, 3, 1, 1, 3)
 
         btn_apply_filters = QPushButton("应用筛选")
-        btn_apply_filters.clicked.connect(self._apply_filter_and_show)
+        btn_apply_filters.clicked.connect(lambda: self._renderTimer.start(0))
         grid_tools.addWidget(btn_apply_filters, 2, 4)
-        self.methodCombo.currentIndexChanged.connect(
-            lambda _i: (self._save_filters(), self._apply_filter_and_show())
-        )
-        self.moduleCombo.currentIndexChanged.connect(
-            lambda _i: (self._save_filters(), self._apply_filter_and_show())
-        )
-        self.createTimeCombo.currentIndexChanged.connect(
-            lambda _i: (self._save_filters(), self._apply_filter_and_show())
-        )
+
+        def _schedule_filters_apply(_i: int) -> None:
+            self._save_filters()
+            self._renderTimer.start(0)
+
+        self.methodCombo.currentIndexChanged.connect(_schedule_filters_apply)
+        self.moduleCombo.currentIndexChanged.connect(_schedule_filters_apply)
+        self.createTimeCombo.currentIndexChanged.connect(_schedule_filters_apply)
 
         # 分组：操作
         grp_actions = QGroupBox("操作", self)
@@ -728,6 +805,12 @@ class MainWindow(QMainWindow):
         self.debugCheck = QCheckBox("启用调试提示")
         self.statusBar().addPermanentWidget(self.debugCheck)
 
+        # 渲染调度定时器（合并多次触发，统一在主线程下一拍执行）
+        self._renderTimer = QTimer(self)
+        self._renderTimer.setSingleShot(True)
+        self._renderTimer.timeout.connect(self._do_render)
+        self._pending_render: dict[str, object] = {}
+
         # 布局（使用 Grid，遵循分组与对齐原则）
         layout.addWidget(grp_conn, 0, 0, 1, 2)
         layout.addWidget(grp_fetch, 1, 0, 1, 2)
@@ -744,10 +827,37 @@ class MainWindow(QMainWindow):
             grp_actions,
         ]
         self.setCentralWidget(central)
+        self._central = central
 
         # 载入设置
         self._settings = QSettings("202Studio", "202Logger")
         self._load_settings()
+
+    def _set_ui_busy(self, busy: bool) -> None:
+        # 统一切换界面交互与等待光标，避免请求进行中操作导致的崩溃
+        try:
+            if busy:
+                QApplication.setOverrideCursor(Qt.WaitCursor)
+            else:
+                QApplication.restoreOverrideCursor()
+        except RuntimeError:
+            pass
+        # 仅禁用交互区域，保留日志视图可滚动
+        for w in [
+            getattr(self, "_btn_query", None),
+            getattr(self, "_btn_fetch", None),
+            getattr(self, "_btn_start", None),
+            getattr(self, "_btn_stop", None),
+            getattr(self, "methodCombo", None),
+            getattr(self, "moduleCombo", None),
+            getattr(self, "createTimeCombo", None),
+            getattr(self, "regexEdit", None),
+        ]:
+            if w is not None:
+                try:
+                    w.setEnabled(not busy)
+                except RuntimeError:
+                    pass
 
     # --------------------- 设置与主题 ---------------------
     def _apply_theme(self, dark: bool) -> None:
@@ -822,6 +932,12 @@ class MainWindow(QMainWindow):
                 self.createTimeCombo.setCurrentIndex(idx_ct)
 
     def closeEvent(self, event) -> None:  # type: ignore[override]
+        # 停止延迟渲染，避免窗口销毁后回调触碰 UI
+        try:
+            if hasattr(self, "_renderTimer") and self._renderTimer is not None:
+                self._renderTimer.stop()
+        except Exception:
+            pass
         self._settings.setValue("conn/host", self.hostEdit.text())
         self._settings.setValue("conn/loginPath", self.loginPathEdit.text())
         self._settings.setValue("conn/username", self.usernameEdit.text())
@@ -847,6 +963,7 @@ class MainWindow(QMainWindow):
         super().closeEvent(event)
 
     # --------------------- 事件处理 ---------------------
+    @Slot()
     def _on_click_login(self) -> None:
         host = self.hostEdit.text().strip()
         login_path = self.loginPathEdit.text().strip() or "/api/v1/auth/login"
@@ -870,6 +987,7 @@ class MainWindow(QMainWindow):
         mode = self.loginModeCombo.currentText()
         self._api.login(login_path, username, password, mode)
 
+    @Slot(LoginResult)
     def _on_login_finished(self, result: LoginResult) -> None:
         if result.success:
             self.tokenEdit.setText(result.token)
@@ -878,6 +996,7 @@ class MainWindow(QMainWindow):
         else:
             self._error(f"登录失败：{result.error_message}")
 
+    @Slot()
     def _on_click_fetch(self) -> None:
         if self._is_fetching:
             self._status.showMessage("已有请求进行中，请稍候…", 3000)
@@ -912,6 +1031,7 @@ class MainWindow(QMainWindow):
         self._requestTimer.start()
         self._api.fetch_logs(device_id, log_path)
 
+    @Slot()
     def _on_click_query(self) -> None:
         if self._is_fetching:
             self._status.showMessage("已有请求进行中，请稍候…", 3000)
@@ -935,6 +1055,8 @@ class MainWindow(QMainWindow):
         # 状态提示保持到数据展示/错误出现后再自动被覆盖
         self._status.showMessage("正在进行分页查询…")
         self._is_fetching = True
+        # UI Busy：防止请求进行中用户操作导致崩溃
+        self._set_ui_busy(True)
         # 清空旧窗口，避免残留
         self._lines_all = []
         self._window_start = 0
@@ -943,11 +1065,12 @@ class MainWindow(QMainWindow):
         self._requestTimer.start()
         self._api.list_error_logs(page_size, page_num, creator)
 
+    @Slot(str)
     def _on_logs_fetched(self, text: str) -> None:
         try:
             self._status.showMessage("日志抓取成功", 2000)
             self._raw_text = text or ""  # 原始文本用于过滤
-            self._apply_filter_and_show()
+            QTimer.singleShot(0, lambda: self._apply_filter_and_show())
         except (
             RuntimeError,
             ValueError,
@@ -959,7 +1082,9 @@ class MainWindow(QMainWindow):
             self._is_fetching = False
             if self._requestTimer.isActive():
                 self._requestTimer.stop()
+            self._set_ui_busy(False)
 
+    @Slot(str)
     def _on_request_failed(self, message: str) -> None:
         try:
             self._error(message)
@@ -967,13 +1092,17 @@ class MainWindow(QMainWindow):
             self._is_fetching = False
             if self._requestTimer.isActive():
                 self._requestTimer.stop()
+            self._set_ui_busy(False)
 
+    @Slot()
     def _on_request_timeout(self) -> None:
         # 超时兜底：复位状态并给出提示
         self._is_fetching = False
         self._status.showMessage("请求超时，请重试或检查网络。", 5000)
+        self._set_ui_busy(False)
 
     # ------ 接收结构化 records，填充 method/module 过滤项 ------
+    @Slot(object)
     def _on_records_received(self, records: object) -> None:
         if not isinstance(records, list):
             return
@@ -1043,12 +1172,22 @@ class MainWindow(QMainWindow):
     def _restore_filters(self) -> None:
         method = self._settings.value("filter/method", "", str)
         module = self._settings.value("filter/module", "", str)
-        idx_m = self.methodCombo.findData(method)
-        if idx_m >= 0:
-            self.methodCombo.setCurrentIndex(idx_m)
-        idx_mod = self.moduleCombo.findData(module)
-        if idx_mod >= 0:
-            self.moduleCombo.setCurrentIndex(idx_mod)
+        # 恢复时禁止触发 currentIndexChanged，避免重入 _apply_filter_and_show
+        self.methodCombo.blockSignals(True)
+        try:
+            idx_m = self.methodCombo.findData(method)
+            if idx_m >= 0:
+                self.methodCombo.setCurrentIndex(idx_m)
+        finally:
+            self.methodCombo.blockSignals(False)
+
+        self.moduleCombo.blockSignals(True)
+        try:
+            idx_mod = self.moduleCombo.findData(module)
+            if idx_mod >= 0:
+                self.moduleCombo.setCurrentIndex(idx_mod)
+        finally:
+            self.moduleCombo.blockSignals(False)
 
     # ---------- 工具：将 ISO8601/字符串时间转换成本地可读时间 ----------
     def _to_local_display_time(self, iso_text: str) -> str:
@@ -1070,6 +1209,7 @@ class MainWindow(QMainWindow):
         except (ValueError, TypeError):
             return text
 
+    @Slot()
     def _on_click_start_auto(self) -> None:
         seconds = int(self.refreshSpin.value())
         self._timer.setInterval(max(1, seconds) * 1000)
@@ -1077,11 +1217,13 @@ class MainWindow(QMainWindow):
             self._timer.start()
         self._ok("已启动自动刷新")
 
+    @Slot()
     def _on_click_stop_auto(self) -> None:
         if self._timer.isActive():
             self._timer.stop()
         self._status.showMessage("已停止自动刷新", 2000)
 
+    @Slot()
     def _on_timer_tick(self) -> None:
         # 根据选择的数据源执行自动刷新
         src = self.refreshSourceCombo.currentText()
@@ -1090,6 +1232,7 @@ class MainWindow(QMainWindow):
         else:
             self._on_click_query()
 
+    @Slot()
     def _on_click_export(self) -> None:
         text = self.logView.toPlainText()
         if not text:
@@ -1106,6 +1249,7 @@ class MainWindow(QMainWindow):
             except OSError as exc:
                 self._error(f"导出失败：{exc}")
 
+    @Slot()
     def _on_click_clear(self) -> None:
         self.logView.clear()
         self._raw_text = ""
@@ -1114,7 +1258,12 @@ class MainWindow(QMainWindow):
     # --------------------- 过滤与显示 ---------------------
     _raw_text: str = ""
 
+    @Slot()
     def _apply_filter_and_show(self) -> None:
+        # 防止重入：渲染尚未结束时再次触发，直接忽略
+        if getattr(self, "_in_render", False):
+            return
+        self._in_render = True
         text = self._raw_text or ""
         pattern = self.regexEdit.text().strip()
         if not text:
@@ -1122,6 +1271,7 @@ class MainWindow(QMainWindow):
             self._window_start = 0
             self._window_end = 0
             self.logView.setPlainText("")
+            self._in_render = False
             return
 
         # 计算内容哈希，避免重复渲染
@@ -1145,6 +1295,7 @@ class MainWindow(QMainWindow):
                     self._last_compiled_flags = flags
             except re.error as exc:
                 self._error(f"正则错误：{exc}")
+                self._in_render = False
                 return
 
         # 结构化过滤：基于 method 与 module 从 records 中生成文本（若可用）
@@ -1229,16 +1380,82 @@ class MainWindow(QMainWindow):
                 scrollbar.value() >= scrollbar.maximum() - 2 if scrollbar else False
             )
 
-            self.logView.setPlainText(new_text)
-            self._last_shown_hash = new_hash
+            # 使用统一的延迟渲染管道，避免在当前调用栈直接触碰 UI
+            self._pending_render = {
+                "text": new_text,
+                "hash": new_hash,
+                "at_bottom": at_bottom,
+                "line_count": len(window_lines),
+                "total_count": len(all_lines),
+            }
+            self._renderTimer.start(0)
+        else:
+            # 无需刷新也要复位渲染标志
+            self._in_render = False
 
-            if at_bottom:
-                scrollbar.setValue(scrollbar.maximum())
+    @Slot()
+    def _do_render(self) -> None:
+        # 统一的延迟渲染执行点（由 _renderTimer 触发）
+        pending = getattr(self, "_pending_render", None)
+        try:
+            # 如果窗口或控件已失效，直接放弃
+            if not self._is_alive(self) or not self._is_alive(
+                getattr(self, "logView", None)
+            ):
+                return
+            if not isinstance(pending, dict) or "text" not in pending:
+                return
+            t = str(pending.get("text") or "")
+            h = int(pending.get("hash") or 0)
+            ab = bool(pending.get("at_bottom"))
+            line_count = int(pending.get("line_count") or 0)
+            total_count = int(pending.get("total_count") or 0)
 
-        self._status.showMessage(
-            f"显示行数：{len(window_lines)} / 总行数：{len(all_lines)}", 1500
-        )
+            # 再次校验滚动条对象有效性
+            sb = (
+                self.logView.verticalScrollBar()
+                if self._is_alive(self.logView)
+                else None
+            )
+            self._in_scroll_update = True
+            try:
+                if sb is not None:
+                    try:
+                        sb.blockSignals(True)
+                    except RuntimeError:
+                        pass
+                try:
+                    self.logView.blockSignals(True)
+                except RuntimeError:
+                    pass
+                try:
+                    self.logView.setPlainText(t)
+                    self._last_shown_hash = h
+                except RuntimeError:
+                    return
+            finally:
+                try:
+                    self.logView.blockSignals(False)
+                except RuntimeError:
+                    pass
+                if sb is not None:
+                    try:
+                        sb.blockSignals(False)
+                    except RuntimeError:
+                        pass
+                self._in_scroll_update = False
 
+            if ab and sb is not None:
+                sb.setValue(sb.maximum())
+            self._status.showMessage(
+                f"显示行数：{line_count} / 总行数：{total_count}", 1500
+            )
+        finally:
+            self._in_render = False
+            if isinstance(pending, dict):
+                pending.clear()
+
+    @Slot(int)
     def _on_log_scroll(self, _val: int) -> None:
         # 仅当滚动到顶部时，尝试向上扩展窗口
         if self._in_scroll_update:
@@ -1291,6 +1508,7 @@ class MainWindow(QMainWindow):
         self._status.showMessage(message, 5000)
         QMessageBox.critical(self, "错误", message)
 
+    @Slot(str)
     def _on_debug_message(self, message: str) -> None:
         if self.debugCheck.isChecked():
             # 仅在开启时弹窗提示，同时写入状态栏
@@ -1298,6 +1516,7 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "调试", message)
 
     # --------------------- 展开/还原 日志区域 ---------------------
+    @Slot(bool)
     def _on_toggle_expand(self, checked: bool) -> None:
         # 根据状态隐藏/显示其他分组，最大化日志可视区域
         try:
@@ -1318,10 +1537,14 @@ class MainWindow(QMainWindow):
             self._status.showMessage(msg, 3000)
 
 
+_CRASH_LOG_FILE = None  # 保持文件句柄存活，确保 faulthandler 可用
+
+
 def main() -> None:
     # 全局：文件日志（含轮转），同时打印到控制台
     log_dir = Path(__file__).resolve().parent
     log_path = log_dir / "202Logger.log"
+    crash_path = log_dir / "202Logger_crash.log"
     logger = logging.getLogger("202Logger")
     logger.setLevel(logging.DEBUG)
     if not logger.handlers:
@@ -1347,6 +1570,17 @@ def main() -> None:
         logger.error(msg)
 
     qInstallMessageHandler(_qt_message_handler)
+
+    # 全局：启用 faulthandler，捕获崩溃类异常（如段错误）到独立文件
+    try:
+        # Windows 下 enable(file) 已足够；保持句柄在 main 生命周期内
+        with open(str(crash_path), "w", encoding="utf-8") as crash_fp:
+            faulthandler.enable(crash_fp)
+    except OSError:
+        try:
+            faulthandler.enable()
+        except (RuntimeError, OSError):
+            pass
 
     # 全局：未捕获异常保护，弹窗并写控制台，避免静默崩溃
     def _excepthook(exc_type, exc, tb):  # type: ignore[no-untyped-def]
