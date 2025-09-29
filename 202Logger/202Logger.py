@@ -37,6 +37,9 @@ from PySide6.QtCore import (
     QObject,
     QSettings,
     QTimer,
+    QThread,
+    QRunnable,
+    QThreadPool,
     QUrl,
     QUrlQuery,
     QByteArray,
@@ -498,9 +501,11 @@ class ApiClient(QObject):
                         return out
 
                     normalized = [_normalize_record(r) for r in records]
+                    # 顺序：page 越大越靠后（升序）
                     records_sorted = sorted(
-                        normalized, key=lambda it: it.get("page", -1), reverse=True
+                        normalized, key=lambda it: it.get("page", -1)
                     )
+                    # 直接输出排序后的 JSON，方便首屏可见；结构化路径也会渲染
                     pretty = json.dumps(records_sorted, ensure_ascii=False, indent=2)
                 else:
                     # 若 obj 本身就是字符串，直接展示
@@ -567,8 +572,9 @@ class ApiClient(QObject):
                         return out
 
                     normalized = [_normalize_record(r) for r in records]
+                    # 顺序：page 越大越靠后（升序）
                     records_sorted = sorted(
-                        normalized, key=lambda it: it.get("page", -1), reverse=True
+                        normalized, key=lambda it: it.get("page", -1)
                     )
                     self.recordsReceived.emit(records_sorted)
             except (json.JSONDecodeError, ValueError, TypeError):  # 安全兜底，保持展示
@@ -652,6 +658,8 @@ class MainWindow(QMainWindow):
         self._last_records_for_filters: list[dict] = []
         # 请求指标
         self._req_meta: dict[int, dict] = {}
+        # 后台渲染线程
+        self._worker_thread: Optional[QThread] = None
 
         # 帮助函数：判断 Qt 对象是否仍然有效
         def _is_alive(obj: object) -> bool:
@@ -807,12 +815,14 @@ class MainWindow(QMainWindow):
         # 正则与大小写变化时，实时应用
         # 防止频繁文本变化导致的重入；加一个轻量去抖
         def _on_regex_changed(_text: str) -> None:
-            self._renderTimer.start(0)
+            # 正则变化需要重算结构化文本
+            self._start_background_render()
 
         self.regexEdit.textChanged.connect(_on_regex_changed)
 
         def _on_case_toggled(_v: bool) -> None:
-            self._renderTimer.start(0)
+            # 大小写切换需要重算结构化文本
+            self._start_background_render()
 
         self.caseCheck.toggled.connect(_on_case_toggled)
 
@@ -841,12 +851,13 @@ class MainWindow(QMainWindow):
         grid_tools.addWidget(self.createTimeCombo, 3, 1, 1, 3)
 
         btn_apply_filters = QPushButton("应用筛选")
-        btn_apply_filters.clicked.connect(lambda: self._renderTimer.start(0))
+        btn_apply_filters.clicked.connect(lambda: self._start_background_render())
         grid_tools.addWidget(btn_apply_filters, 2, 4)
 
         def _schedule_filters_apply(_i: int) -> None:
             self._save_filters()
-            self._renderTimer.start(0)
+            # method/module/createTime 变化需要重算结构化文本
+            self._start_background_render()
 
         self.methodCombo.currentIndexChanged.connect(_schedule_filters_apply)
         self.moduleCombo.currentIndexChanged.connect(_schedule_filters_apply)
@@ -1194,6 +1205,8 @@ class MainWindow(QMainWindow):
         if not isinstance(records, list):
             return
         self._last_records_for_filters = records
+        # 后台计算渲染文本，避免阻塞 UI
+        self._start_background_render()
         methods = set()
         modules = set()
         times = []
@@ -1342,6 +1355,111 @@ class MainWindow(QMainWindow):
         self._raw_text = ""
         self._status.showMessage("已清空", 1500)
 
+    # --------------------- 后台渲染 ---------------------
+    def _start_background_render(self) -> None:
+        # 如果已有线程在跑，先停止
+        if getattr(self, "_worker_thread", None) is not None:
+            try:
+                self._worker_thread.quit()
+                self._worker_thread.wait(100)
+            except Exception:
+                pass
+
+        records = list(self._last_records_for_filters or [])
+        pattern = self.regexEdit.text().strip()
+        case_ins = self.caseCheck.isChecked()
+        selected_method = self.methodCombo.currentData() or ""
+        selected_module = self.moduleCombo.currentData() or ""
+        select_ct = self.createTimeCombo.currentData() or ""
+
+        # 在线程中执行：过滤与文本拼接
+        from PySide6.QtCore import QRunnable, QThreadPool, QObject, Signal
+
+        class RenderTask(QObject, QRunnable):
+            done = Signal(str, int, int)
+
+            def __init__(self, recs, pat, ci, sm, smod, sct):
+                QObject.__init__(self)
+                QRunnable.__init__(self)
+                self.recs = recs
+                self.pat = pat
+                self.ci = ci
+                self.sm = sm
+                self.smod = smod
+                self.sct = sct
+
+            def run(self) -> None:
+                import re as _re
+
+                buf: list[str] = []
+                compiled = None
+                if self.pat:
+                    try:
+                        compiled = _re.compile(
+                            self.pat, _re.IGNORECASE if self.ci else 0
+                        )
+                    except Exception:
+                        compiled = None
+                for item in self.recs:
+                    if not isinstance(item, dict):
+                        continue
+                    if self.sct and item.get("createTime") != self.sct:
+                        continue
+                    if self.sm and item.get("method") != self.sm:
+                        continue
+                    em = item.get("errorMsg")
+                    em_obj = None
+                    try:
+                        if isinstance(em, str):
+                            em_obj = json.loads(em)
+                        elif isinstance(em, dict):
+                            em_obj = em
+                    except Exception:
+                        em_obj = None
+                    if isinstance(em_obj, dict):
+                        keys = (
+                            [self.smod]
+                            if self.smod
+                            else [k for k in em_obj.keys() if k != "page"]
+                        )
+                        for k in keys:
+                            if not k:
+                                continue
+                            val = em_obj.get(k)
+                            if isinstance(val, list):
+                                buf.extend(str(x).rstrip("\n") for x in val)
+                            elif isinstance(val, str):
+                                buf.extend(val.splitlines())
+                    elif not self.smod:
+                        if isinstance(em_obj, list):
+                            buf.extend(str(x).rstrip("\n") for x in em_obj)
+                        elif isinstance(em, str):
+                            buf.extend(em.splitlines())
+                lines = buf
+                if compiled is not None:
+                    lines = [ln for ln in lines if compiled.search(ln)]
+                text = "\n".join(lines)
+                self.done.emit(text, len(lines), len(lines))
+
+        task = RenderTask(
+            records, pattern, case_ins, selected_method, selected_module, select_ct
+        )
+        task.done.connect(self._on_render_done, type=Qt.QueuedConnection)
+        QThreadPool.globalInstance().start(task)
+
+    @Slot(str, int, int)
+    def _on_render_done(self, text: str, line_count: int, total_count: int) -> None:
+        # 更新 _raw_text 并通过统一渲染通道展示
+        self._raw_text = text or ""
+        self._pending_render = {
+            "text": self._raw_text,
+            "hash": hash(self._raw_text),
+            "at_bottom": True,
+            "line_count": line_count,
+            "total_count": total_count,
+        }
+        self._renderTimer.start(0)
+
     # --------------------- 过滤与显示 ---------------------
     _raw_text: str = ""
 
@@ -1353,7 +1471,9 @@ class MainWindow(QMainWindow):
         self._in_render = True
         text = self._raw_text or ""
         pattern = self.regexEdit.text().strip()
-        if not text:
+        # 若无原始文本，但已有结构化 records，则继续按结构化渲染；
+        # 仅当同时缺少两者时才清空返回
+        if (not text) and (not self._last_records_for_filters):
             self._lines_all = []
             self._window_start = 0
             self._window_end = 0
@@ -1434,6 +1554,21 @@ class MainWindow(QMainWindow):
                             # 非 JSON 文本，未指定模块时整体纳入
                             if not selected_module:
                                 buf.extend(em.splitlines())
+                    elif isinstance(em, dict):
+                        # 服务器直接返回对象时的兼容处理
+                        keys = (
+                            [selected_module]
+                            if selected_module
+                            else [k for k in em.keys() if k != "page"]
+                        )
+                        for k in keys:
+                            if not k:
+                                continue
+                            val = em.get(k)
+                            if isinstance(val, list):
+                                buf.extend(str(x).rstrip("\n") for x in val)
+                            elif isinstance(val, str):
+                                buf.extend(val.splitlines())
                 structured_lines = buf
         except (TypeError, AttributeError):
             structured_lines = None
@@ -1498,45 +1633,74 @@ class MainWindow(QMainWindow):
             line_count = int(pending.get("line_count") or 0)
             total_count = int(pending.get("total_count") or 0)
 
-            # 再次校验滚动条对象有效性
-            sb = (
-                self.logView.verticalScrollBar()
-                if self._is_alive(self.logView)
-                else None
+            # 对超大文本进行窗口化，仅显示最后 max_lines 行，避免一次性渲染过大文本
+            lines_all = t.splitlines()
+            max_lines = (
+                int(self.maxLinesSpin.value())
+                if hasattr(self, "maxLinesSpin")
+                else 5000
             )
-            self._in_scroll_update = True
-            try:
-                if sb is not None:
-                    try:
-                        sb.blockSignals(True)
-                    except RuntimeError:
-                        pass
-                try:
-                    self.logView.blockSignals(True)
-                except RuntimeError:
-                    pass
-                try:
-                    self.logView.setPlainText(t)
-                    self._last_shown_hash = h
-                except RuntimeError:
-                    return
-            finally:
-                try:
-                    self.logView.blockSignals(False)
-                except RuntimeError:
-                    pass
-                if sb is not None:
-                    try:
-                        sb.blockSignals(False)
-                    except RuntimeError:
-                        pass
-                self._in_scroll_update = False
+            end = len(lines_all)
+            start = max(0, end - max_lines)
+            window_lines = lines_all[start:end]
+            t_window = "\n".join(window_lines)
 
-            if ab and sb is not None:
-                sb.setValue(sb.maximum())
-            self._status.showMessage(
-                f"显示行数：{line_count} / 总行数：{total_count}", 1500
-            )
+            # 延后到下一拍应用文本，避免在错误的栈触碰 UI
+            shown = len(window_lines)
+            total = len(lines_all)
+
+            def _apply() -> None:
+                try:
+                    if QApplication.instance() is None:
+                        return
+                    if not self._is_alive(self) or not self._is_alive(
+                        getattr(self, "logView", None)
+                    ):
+                        return
+                    sb = (
+                        self.logView.verticalScrollBar()
+                        if self._is_alive(self.logView)
+                        else None
+                    )
+                    self._in_scroll_update = True
+                    try:
+                        if sb is not None:
+                            try:
+                                sb.blockSignals(True)
+                            except RuntimeError:
+                                pass
+                        try:
+                            self.logView.blockSignals(True)
+                        except RuntimeError:
+                            pass
+                        # 两阶段渲染，降低一次性 setPlainText 引起的原生层异常概率
+                        self.logView.setPlainText("")
+                        QTimer.singleShot(
+                            0, lambda: self.logView.setPlainText(t_window)
+                        )
+                        self._last_shown_hash = h
+                    except RuntimeError:
+                        return
+                    finally:
+                        try:
+                            self.logView.blockSignals(False)
+                        except RuntimeError:
+                            pass
+                        if sb is not None:
+                            try:
+                                sb.blockSignals(False)
+                            except RuntimeError:
+                                pass
+                        self._in_scroll_update = False
+                    if ab and sb is not None:
+                        sb.setValue(sb.maximum())
+                    self._status.showMessage(
+                        f"显示行数：{shown} / 总行数：{total}", 1500
+                    )
+                except Exception as exc:
+                    logging.getLogger("202Logger").exception("_apply failed: %s", exc)
+
+            QTimer.singleShot(0, _apply)
         finally:
             self._in_render = False
             if isinstance(pending, dict):
@@ -1627,6 +1791,121 @@ class MainWindow(QMainWindow):
 _CRASH_LOG_FILE = None  # 保持文件句柄存活，确保 faulthandler 可用
 
 
+# --------------------- 后台渲染任务 ---------------------
+class RenderTask(QRunnable):
+    """在后台线程构建渲染文本，避免阻塞 UI。
+
+    参数：
+      records: 已按 page 排序的记录列表
+      pattern: 正则字符串
+      case_insensitive: 是否忽略大小写
+      selected_method: 过滤的 method
+      selected_module: 过滤的模块键
+      selected_create_time: 过滤的 createTime
+      on_done: 回调 (text:str, shown:int, total:int) → None
+    """
+
+    def __init__(
+        self,
+        *,
+        records: list,
+        pattern: str,
+        case_insensitive: bool,
+        selected_method: str,
+        selected_module: str,
+        selected_create_time: str,
+        on_done,
+    ) -> None:
+        super().__init__()
+        self._records = records
+        self._pattern = pattern
+        self._case_ins = case_insensitive
+        self._sel_method = selected_method
+        self._sel_module = selected_module
+        self._sel_ct = selected_create_time
+        self._on_done = on_done
+
+    def run(self) -> None:  # type: ignore[override]
+        import re as _re
+
+        # 预编译正则
+        compiled = None
+        if self._pattern:
+            try:
+                compiled = _re.compile(
+                    self._pattern, _re.IGNORECASE if self._case_ins else 0
+                )
+            except _re.error:
+                compiled = None
+
+        # 确保按 page 升序（page 越大越靠后）遍历记录
+        def _page_from_item(it: object) -> int:
+            try:
+                if not isinstance(it, dict):
+                    return -1
+                em = it.get("errorMsg")
+                page_val = None
+                if isinstance(em, dict):
+                    page_val = em.get("page")
+                elif isinstance(em, str):
+                    try:
+                        obj = json.loads(em)
+                    except (json.JSONDecodeError, ValueError, TypeError):
+                        obj = None
+                    if isinstance(obj, dict):
+                        page_val = obj.get("page")
+                if isinstance(page_val, str):
+                    page_val = int(page_val) if page_val.isdigit() else None
+                return int(page_val) if isinstance(page_val, (int, float)) else -1
+            except (ValueError, TypeError, AttributeError):
+                return -1
+
+        recs_sorted = sorted(list(self._records), key=_page_from_item)
+
+        buf: list[str] = []
+        for item in recs_sorted:
+            if not isinstance(item, dict):
+                continue
+            if self._sel_ct and item.get("createTime") != self._sel_ct:
+                continue
+            if self._sel_method and item.get("method") != self._sel_method:
+                continue
+            em = item.get("errorMsg")
+            em_obj = None
+            try:
+                if isinstance(em, str):
+                    em_obj = json.loads(em)
+                elif isinstance(em, dict):
+                    em_obj = em
+            except (json.JSONDecodeError, ValueError, TypeError):
+                em_obj = None
+
+            if isinstance(em_obj, dict):
+                keys = (
+                    [self._sel_module]
+                    if self._sel_module
+                    else [k for k in em_obj.keys() if k != "page"]
+                )
+                for k in keys:
+                    if not k:
+                        continue
+                    val = em_obj.get(k)
+                    if isinstance(val, list):
+                        buf.extend(str(x).rstrip("\n") for x in val)
+                    elif isinstance(val, str):
+                        buf.extend(val.splitlines())
+            elif not self._sel_module:
+                if isinstance(em_obj, list):
+                    buf.extend(str(x).rstrip("\n") for x in em_obj)
+                elif isinstance(em, str):
+                    buf.extend(em.splitlines())
+
+        lines = buf if compiled is None else [ln for ln in buf if compiled.search(ln)]
+        text = "\n".join(lines)
+        # 回到主线程执行回调
+        QTimer.singleShot(0, lambda t=text, n=len(lines): self._on_done(t, n, n))
+
+
 def main() -> None:
     # 全局：文件日志（含轮转），同时打印到控制台
     log_dir = Path(__file__).resolve().parent
@@ -1659,10 +1938,16 @@ def main() -> None:
     qInstallMessageHandler(_qt_message_handler)
 
     # 全局：启用 faulthandler，捕获崩溃类异常（如段错误）到独立文件
+    global _CRASH_LOG_FILE
     try:
-        # Windows 下 enable(file) 已足够；保持句柄在 main 生命周期内
-        with open(str(crash_path), "w", encoding="utf-8") as crash_fp:
-            faulthandler.enable(crash_fp)
+        # 重要：文件句柄需常驻，不能使用 with 语句，否则关闭后无法写入
+        _CRASH_LOG_FILE = open(str(crash_path), "w", encoding="utf-8", buffering=1)
+        faulthandler.enable(_CRASH_LOG_FILE)
+        # 周期性转储所有线程栈，定位“无日志崩溃”
+        try:
+            faulthandler.dump_traceback_later(5.0, repeat=True, file=_CRASH_LOG_FILE)
+        except Exception:
+            pass
     except OSError:
         try:
             faulthandler.enable()
@@ -1683,7 +1968,19 @@ def main() -> None:
     win = MainWindow()
     win.resize(1000, 700)
     win.show()
-    app.exec()
+    try:
+        app.exec()
+    finally:
+        # 退出时取消定期转储并关闭文件
+        try:
+            faulthandler.cancel_dump_traceback_later()
+        except Exception:
+            pass
+        if _CRASH_LOG_FILE is not None:
+            try:
+                _CRASH_LOG_FILE.close()
+            except Exception:
+                pass
 
 
 if __name__ == "__main__":

@@ -1,0 +1,6 @@
+2025-09-29 13:21:40,895 [ERROR] 未捕获异常：Traceback (most recent call last):
+  File "f:\Project\newTool\202Logger\202Logger.py", line 1027, in closeEvent
+    if idx_ct >= 0:
+    
+KeyboardInterrupt
+NoneType: None
