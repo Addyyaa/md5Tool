@@ -457,7 +457,51 @@ class ApiClient(QObject):
                         records = obj["records"]
                 # 兼容 data 直接是字符串日志（如 cmd）
                 if isinstance(records, list):
-                    pretty = json.dumps(records, ensure_ascii=False, indent=2)
+                    # 归一化：提取 errorMsg.page → 顶层 page，并进行排序（降序，越新越大）
+                    def _extract_page_from_error_msg(em) -> int:
+                        try:
+                            page_val = None
+                            if isinstance(em, dict):
+                                page_val = em.get("page")
+                            elif isinstance(em, str):
+                                try:
+                                    em_obj = json.loads(em)
+                                except (json.JSONDecodeError, ValueError, TypeError):
+                                    em_obj = None
+                                if isinstance(em_obj, dict):
+                                    page_val = em_obj.get("page")
+                            if isinstance(page_val, str):
+                                page_val = int(page_val) if page_val.isdigit() else None
+                            return (
+                                int(page_val)
+                                if isinstance(page_val, (int, float))
+                                else -1
+                            )
+                        except (ValueError, TypeError, AttributeError):
+                            return -1
+
+                    def _normalize_record(rec: object) -> dict:
+                        if not isinstance(rec, dict):
+                            return {"errorMsg": rec, "page": -1}
+                        out = dict(rec)
+                        em = out.get("errorMsg")
+                        out["page"] = _extract_page_from_error_msg(em)
+                        # 缓存模块键，剔除 'page'
+                        try:
+                            em_obj = json.loads(em) if isinstance(em, str) else em
+                            if isinstance(em_obj, dict):
+                                out["_moduleKeys"] = [
+                                    k for k in em_obj.keys() if k != "page"
+                                ]
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+                        return out
+
+                    normalized = [_normalize_record(r) for r in records]
+                    records_sorted = sorted(
+                        normalized, key=lambda it: it.get("page", -1), reverse=True
+                    )
+                    pretty = json.dumps(records_sorted, ensure_ascii=False, indent=2)
                 else:
                     # 若 obj 本身就是字符串，直接展示
                     if isinstance(obj, str):
@@ -483,7 +527,50 @@ class ApiClient(QObject):
                     elif isinstance(obj.get("records"), list):
                         records = obj.get("records")
                 if isinstance(records, list):
-                    self.recordsReceived.emit(records)
+                    # 与展示一致：发射归一化并排序后的列表
+                    def _extract_page_from_error_msg(em) -> int:
+                        try:
+                            page_val = None
+                            if isinstance(em, dict):
+                                page_val = em.get("page")
+                            elif isinstance(em, str):
+                                try:
+                                    em_obj = json.loads(em)
+                                except (json.JSONDecodeError, ValueError, TypeError):
+                                    em_obj = None
+                                if isinstance(em_obj, dict):
+                                    page_val = em_obj.get("page")
+                            if isinstance(page_val, str):
+                                page_val = int(page_val) if page_val.isdigit() else None
+                            return (
+                                int(page_val)
+                                if isinstance(page_val, (int, float))
+                                else -1
+                            )
+                        except (ValueError, TypeError, AttributeError):
+                            return -1
+
+                    def _normalize_record(rec: object) -> dict:
+                        if not isinstance(rec, dict):
+                            return {"errorMsg": rec, "page": -1}
+                        out = dict(rec)
+                        em = out.get("errorMsg")
+                        out["page"] = _extract_page_from_error_msg(em)
+                        try:
+                            em_obj = json.loads(em) if isinstance(em, str) else em
+                            if isinstance(em_obj, dict):
+                                out["_moduleKeys"] = [
+                                    k for k in em_obj.keys() if k != "page"
+                                ]
+                        except (json.JSONDecodeError, ValueError, TypeError):
+                            pass
+                        return out
+
+                    normalized = [_normalize_record(r) for r in records]
+                    records_sorted = sorted(
+                        normalized, key=lambda it: it.get("page", -1), reverse=True
+                    )
+                    self.recordsReceived.emit(records_sorted)
             except (json.JSONDecodeError, ValueError, TypeError):  # 安全兜底，保持展示
                 pass
             # 将 UI 更新放入主线程事件队列，避免网络线程直接调用槽
@@ -1118,14 +1205,14 @@ class MainWindow(QMainWindow):
                 ct = item.get("createTime")
                 if isinstance(ct, str) and ct:
                     times.append(ct)
-                # errorMsg 可能是 JSON 字符串，内部键是模块名
+                # errorMsg 可能是 JSON 字符串，内部键是模块名（排除 'page'）
                 em = item.get("errorMsg")
                 if isinstance(em, str) and em:
                     try:
                         em_obj = json.loads(em)
                         if isinstance(em_obj, dict):
                             for k in em_obj.keys():
-                                if isinstance(k, str) and k:
+                                if isinstance(k, str) and k and k != "page":
                                     modules.add(k)
                     except (json.JSONDecodeError, ValueError, TypeError):
                         pass
@@ -1309,7 +1396,7 @@ class MainWindow(QMainWindow):
                 # 解析 createTime 精确筛选
                 select_ct = self.createTimeCombo.currentData() or ""
 
-                for item in self._last_records_for_filters:
+                for item in self._last_records_for_filters:  # 已按 page 降序的记录
                     if not isinstance(item, dict):
                         continue
                     # createTime 等值过滤
@@ -1326,7 +1413,7 @@ class MainWindow(QMainWindow):
                                 keys = (
                                     [selected_module]
                                     if selected_module
-                                    else list(em_obj.keys())
+                                    else [k for k in em_obj.keys() if k != "page"]
                                 )
                                 for k in keys:
                                     if not k:
