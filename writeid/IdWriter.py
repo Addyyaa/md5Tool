@@ -12,6 +12,7 @@ import netifaces
 import psutil
 import wmi
 import datetime
+import pythoncom
 
 
 # 定义日志
@@ -78,11 +79,12 @@ def lan_ip_detect():
 
 def write_id(tn, id):
     try:
+        print(f"开始写入设备ID-{id}")
         tn.write(f"cat /customer/screenId.ini\n".encode("utf-8"))
         time.sleep(0.5)
         tn.write(f'echo "[screen]" > /customer/screenId.ini\n'.encode("utf-8"))
         tn.write(f'echo "deviceId={id}" >> /customer/screenId.ini\n'.encode("utf-8"))
-        tn.write(f"cat /customer/screenId.ini\n".encode("utf-8"))
+        tn.write(f"sync\n".encode("utf-8"))
         time.sleep(1)
         a = tn.read_very_eager().decode("utf-8", errors="ignore")
         if id in a:
@@ -95,23 +97,52 @@ def write_id(tn, id):
         return False
 
 
-def get_uuid():
-    c = wmi.WMI()
-    uuid = ""
-    for system in c.Win32_ComputerSystemProduct():
-        if system.UUID:
-            uuid = system.UUID
-            break
+def generate_temp_device_id(prefix: str = "PSa") -> str:
+    """生成时间戳型设备ID，保证在无法获取真实设备指纹时也可写入占位值。"""
+    now = datetime.datetime.now()
+    return f"{prefix}{now:%Y%m%d%H%M%S}"
+
+
+def get_uuid() -> str:
+    """通过 WMI 获取设备 UUID，失败时回退为网卡 MAC 或时间戳 ID。"""
+    fallback_id = generate_temp_device_id()
+    initialized = False
+    c = None
+    try:
+        pythoncom.CoInitialize()
+        initialized = True
+        c = wmi.WMI()
+
+        uuid = ""
+        try:
+            for system in c.Win32_ComputerSystemProduct():
+                if system.UUID:
+                    uuid = system.UUID
+                    break
+        except Exception as err:  # noqa: BLE001
+            logging.warning("读取 Win32_ComputerSystemProduct 失败：%s", err)
+
+        if not uuid:
+            try:
+                for adapter in c.Win32_NetworkAdapterConfiguration(IPEnabled=True):
+                    if adapter.MACAddress:
+                        uuid = adapter.MACAddress
+                        break
+            except Exception as err:  # noqa: BLE001
+                logging.warning("读取网卡 MAC 地址失败：%s", err)
+    except Exception as err:  # noqa: BLE001
+        logging.error("初始化 WMI 失败：%s", err)
+        return fallback_id
+    finally:
+        if initialized:
+            pythoncom.CoUninitialize()
+
     if not uuid:
-        for adapter in c.Win32_NetworkAdapterConfiguration(IPEnabled=True):
-            if adapter.MACAddress:
-                uuid = adapter.MACAddress
-                break
-    if not uuid:
-        return f"PSa{datetime.datetime.now().strftime('%Y%m%d%H%M%S')}"
-    uuid = uuid.replace(":", "")[-6:]
-    ct = datetime.datetime.now().strftime("%Y%m%d")
-    return "PSa" + ct + uuid
+        return fallback_id
+
+    uuid = str(uuid).replace(":", "")[-10:]
+    ct = datetime.datetime.now().strftime("%Y")
+    return f"PSa{ct}{uuid}"
 
 
 def scan_port(host, port) -> Union[list, bool, telnetlib.Telnet]:
@@ -139,13 +170,16 @@ def scan_port(host, port) -> Union[list, bool, telnetlib.Telnet]:
                 if match:
                     screen = match.group(1)
                     break
+                else:
+                    print(match, host)
                 attempts += 1
             else:
-                # 如果超过最大尝试次数仍未找到deviceId，关闭连接并返回False
-                logging.warning(f"开始对 {host} 进行写入设备ID")
-                write_id(tn, get_uuid())
+                uuid = get_uuid()
+                # 如果超过最大尝试次数仍未找到deviceId，关闭连接并返回True
+                print(f"\n开始对 {host} 进行写入设备ID-{uuid}")
+                write_id(tn, uuid)
                 tn.close()
-                return False
+            return False
             return [screen, tn, host]
         else:
             tn.close()
@@ -154,294 +188,10 @@ def scan_port(host, port) -> Union[list, bool, telnetlib.Telnet]:
         return False
 
 
-def modify_location(screen: str, tn: telnetlib.Telnet, host: str, option: str):
-    times1 = 0
-    times2 = 0
-
-    # 检查是否是新的版本固件
-    is_new_fw, mqtt_ini, mqtt_log, local_ini = set_config(tn)
-    local_value = "1"
-    mqtt_prefix = "echo [mqtt]"
-    cn_mqtt_value_prefix = "echo cn_host="
-    en_mqtt_value_prefix = "echo en_host="
-    cn_mqtt_port_prefix = "echo cn_port="
-    en_mqtt_port_prefix = "echo en_port="
-    port_section = "echo [http]"
-    cn_port_prefix = "echo cn_port="
-    en_port_prefix = "echo en_port="
-    cn_port_value = "8080"
-    en_port_value = "8080"
-    cn_mqtt_port_value = "1883"
-    en_mqtt_port_value = "1883"
-    local_prefix = "echo [local]"
-    local_value_prefix = "echo local="
-    old_local_ini_path = "/upgrade/local.ini"
-    selected_server = ""
-    while True:
-        if times1 >= 10:
-            logging.error(f"版本切换失败，请重新尝试或者联系售后")
-            break
-        if option == "1":
-            selected_server = cn_server_release
-            tn.write(f"{mqtt_prefix} > {mqtt_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{cn_mqtt_value_prefix}{cn_server_release} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{cn_mqtt_port_prefix}{cn_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_value_prefix}{en_server_release} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_port_prefix}{en_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(f"{local_prefix} > {local_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{local_value_prefix}{local_value} >> {local_ini}\n".encode("utf-8")
-            )
-            if not is_new_fw:
-                tn.write(f"{local_prefix} > {old_local_ini_path}\n".encode("utf-8"))
-                tn.write(
-                    f"{local_value_prefix}{local_value} >> {old_local_ini_path}\n".encode(
-                        "utf-8"
-                    )
-                )
-        elif option == "2":
-            selected_server = en_server_release
-            local_value = "2"
-            tn.write(f"{mqtt_prefix} > {mqtt_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{cn_mqtt_value_prefix}{cn_server_release} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{cn_mqtt_port_prefix}{cn_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_value_prefix}{en_server_release} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_port_prefix}{en_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(f"{local_prefix} > {local_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{local_value_prefix}{local_value} >> {local_ini}\n".encode("utf-8")
-            )
-            if not is_new_fw:
-                tn.write(f"{local_prefix} > {old_local_ini_path}\n".encode("utf-8"))
-                tn.write(
-                    f"{local_value_prefix}{local_value} >> {old_local_ini_path}\n".encode(
-                        "utf-8"
-                    )
-                )
-        elif option == "3":  # 大陆版，但是要是英语
-            selected_server = cn_server_release
-            tn.write(f"{mqtt_prefix} > {mqtt_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{cn_mqtt_value_prefix}{en_server_release} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{cn_mqtt_port_prefix}{cn_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_value_prefix}{cn_server_release} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_port_prefix}{en_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            # 将location改为2
-            local_value = "2"
-            tn.write(f"{local_prefix} > {local_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{local_value_prefix}{local_value} >> {local_ini}\n".encode("utf-8")
-            )
-            if not is_new_fw:
-                tn.write(f"{local_prefix} > {old_local_ini_path}\n".encode("utf-8"))
-                tn.write(
-                    f"{local_value_prefix}{local_value} >> {old_local_ini_path}\n".encode(
-                        "utf-8"
-                    )
-                )
-        elif option == "4":  # 海外版，但是要是中文
-            selected_server = en_server_release
-            tn.write(f"{mqtt_prefix} > {mqtt_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{cn_mqtt_value_prefix}{en_server_release} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{cn_mqtt_port_prefix}{cn_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_value_prefix}{cn_server_release} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_port_prefix}{en_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            # 将location改为1
-            local_value = "1"
-            tn.write(f"{local_prefix} > {local_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{local_value_prefix}{local_value} >> {local_ini}\n".encode("utf-8")
-            )
-            if not is_new_fw:
-                tn.write(f"{local_prefix} > {old_local_ini_path}\n".encode("utf-8"))
-                tn.write(
-                    f"{local_value_prefix}{local_value} >> {old_local_ini_path}\n".encode(
-                        "utf-8"
-                    )
-                )
-        elif option == "5":  # 国内测试环境
-            selected_server = cn_server_test
-            tn.write(f"{mqtt_prefix} > {mqtt_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{cn_mqtt_value_prefix}{cn_server_test} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{cn_mqtt_port_prefix}{cn_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_value_prefix}{en_server_test} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_port_prefix}{en_mqtt_port_value} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            # 将location改为1
-            local_value = "1"
-            tn.write(f"{local_prefix} > {local_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{local_value_prefix}{local_value} >> {local_ini}\n".encode("utf-8")
-            )
-            if not is_new_fw:
-                tn.write(f"{local_prefix} > {old_local_ini_path}\n".encode("utf-8"))
-                tn.write(
-                    f"{local_value_prefix}{local_value} >> {old_local_ini_path}\n".encode(
-                        "utf-8"
-                    )
-                )
-        else:  # 海外测试环境
-            selected_server = en_server_test
-            tn.write(f"{mqtt_prefix} > {mqtt_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{cn_mqtt_value_prefix}{cn_server_test} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            tn.write(
-                f"{en_mqtt_value_prefix}{en_server_test} >> {mqtt_ini}\n".encode(
-                    "utf-8"
-                )
-            )
-            # 将location改为2
-            local_value = "2"
-            tn.write(f"{local_prefix} > {local_ini}\n".encode("utf-8"))
-            tn.write(
-                f"{local_value_prefix}{local_value} >> {local_ini}\n".encode("utf-8")
-            )
-            if not is_new_fw:
-                tn.write(f"{local_prefix} > {old_local_ini_path}\n".encode("utf-8"))
-                tn.write(
-                    f"{local_value_prefix}{local_value} >> {old_local_ini_path}\n".encode(
-                        "utf-8"
-                    )
-                )
-
-        # 兼容云同步版本增加了http端口
-        if is_new_fw:
-            if option not in ["1", "2", "3", "4"]:
-                cn_port_value = "8082"
-                tn.write(f"{port_section} >> {mqtt_ini}\n".encode("utf-8"))
-                tn.write(
-                    f"{cn_port_prefix}{cn_port_value} >> {mqtt_ini}\n".encode("utf-8")
-                )
-                tn.write(
-                    f"{en_port_prefix}{en_port_value} >> {mqtt_ini}\n".encode("utf-8")
-                )
-            else:
-                tn.write(f"{port_section} >> {mqtt_ini}\n".encode("utf-8"))
-                tn.write(
-                    f"{cn_port_prefix}{cn_port_value} >> {mqtt_ini}\n".encode("utf-8")
-                )
-                tn.write(
-                    f"{en_port_prefix}{en_port_value} >> {mqtt_ini}\n".encode("utf-8")
-                )
-
-        # 校验是否切换成功
-        def check_switch_success(tn: telnetlib.Telnet):
-            ck_cmd = [
-                f"killall -9 mymqtt\n",
-                f"cat {mqtt_log} | grep {selected_server} && echo $?-success\n",
-            ]
-            try:
-                # 先清空日志
-                tn.write(f'echo "" > {mqtt_log}\n'.encode("utf-8"))
-                tn.write(ck_cmd[0].encode("utf-8"))
-                for _ in range(10):
-                    tn.write(ck_cmd[1].encode("utf-8"))
-                    result = tn.read_very_eager()
-                    if "0-success" in result.decode("utf-8", errors="ignore"):
-                        return True
-                    time.sleep(3)
-            except Exception as e:
-                print(f"check_switch_success 异常: {e}")
-                import traceback
-
-                traceback.print_exc()
-                return False
-
-        try:
-            if check_switch_success(tn):
-                print(f"{screen}-{host}\t版本切换成功")
-                return True
-            else:
-                times1 += 1
-                continue
-        except Exception as e:
-            logging.error(f"{host-screen}发生错误：{e}")
-
-
 def cmd_check(tn: telnetlib.Telnet, cmd: list, text: str):
     times1 = 0
     text = text.encode("utf-8")
+
     while True:
         for i in cmd:
             tn.write(i.encode("utf-8") + b"\n")
@@ -481,3 +231,6 @@ with concurrent.futures.ThreadPoolExecutor(max_workers=50) as executor:
     if not screen_list:
         input("\n未发现设备，按回车键退出程序")
         sys.exit()
+
+    input("按回车键退出程序...")
+    sys.exit()
